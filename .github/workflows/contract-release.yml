@@ -3,6 +3,10 @@ name: Build and Release Contract
 on:
   workflow_call:
     inputs:
+      profile:
+        description: "Cargo profile to build the contract under. Default release"
+        type: string
+        required: false
       relative_path:
         description: "Relative path to the working directory"
         type: string
@@ -103,9 +107,9 @@ jobs:
           echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
 
       - name: Build contract
-        uses: stellar/stellar-cli@v25.1.0
+        uses: stellar/stellar-cli@v26.0.0
         with:
-          version: "22.8.1"
+          version: "26.0.0"
       - run: |
           # Navigate to the working directory
           cd ${WORK_DIR}
@@ -120,6 +124,12 @@ jobs:
           fi
           if [ "${{ inputs.home_domain }}" ]; then
             COMMAND_ARGS="$COMMAND_ARGS --meta home_domain=${{ inputs.home_domain }}"
+          fi
+
+          if [ "${{ inputs.profile }}" ]; then
+              COMMAND_ARGS="--profile ${{ inputs.profile }} $COMMAND_ARGS"
+          else
+              COMMAND_ARGS="--profile release $COMMAND_ARGS"  
           fi
 
           # Build the contract
