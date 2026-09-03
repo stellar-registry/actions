@@ -1,0 +1,234 @@
+name: Publish to Registry
+
+# Reusable: publish an already-built (ideally attested) contract wasm to a
+# Stellar Registry, authored by an OpenZeppelin SMART ACCOUNT. Pairs with
+# contract-release.yml (build + optimize + attest + GitHub release): a caller
+# runs that first, then hands the release asset to this workflow.
+#
+# The publish is authorized by the smart account's own context rule — signed by
+# a CAP-71 delegate key. That needs a `stellar` that can sign smart-account
+# authorizations, which upstream cannot yet (it rejects contract-address
+# credentials); this installs the theahaco/stellar-cli fork, which discovers the
+# account's context rule on-chain and signs with `--sign-with-key`. No
+# smart-account-specific flags, and no project-specific signer binary.
+#
+# Every wasm goes on-chain as `contract upload` (installs the code, any size) +
+# `registry.publish_hash` (binds name→hash→author, smart-account-signed), so the
+# same path works for small and large (>48 KiB) contracts alike.
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "Registry contract id (C…) to publish into."
+        required: true
+        type: string
+      wasm_name:
+        description: "Name to publish the wasm under."
+        required: true
+        type: string
+      author:
+        description: "Author: the OZ smart-account contract (C…) that owns the name."
+        required: true
+        type: string
+      version:
+        description: "Version string to publish."
+        required: true
+        type: string
+      release_tag:
+        description: "GitHub release tag holding the built wasm asset."
+        required: true
+        type: string
+      wasm_asset:
+        description: "Wasm asset filename on the release (e.g. my-contract_v1.2.3.wasm)."
+        required: true
+        type: string
+      network:
+        description: "Stellar network passphrase key: testnet | mainnet."
+        required: false
+        default: testnet
+        type: string
+      rpc_url:
+        description: "Soroban RPC URL. Defaults to the public endpoint for `network`."
+        required: false
+        type: string
+      network_passphrase:
+        description: "Network passphrase. Defaults to the constant for `network`."
+        required: false
+        type: string
+      deploy:
+        description: "Also `deploy_stateless` the published wasm (content-addressed)."
+        required: false
+        default: true
+        type: boolean
+      verify_attestation:
+        description: "Verify the asset's GitHub build provenance before publishing."
+        required: false
+        default: true
+        type: boolean
+      attestation_signer_workflow:
+        description: "Reusable workflow that produced the attestation (for `gh attestation verify --signer-workflow`)."
+        required: false
+        default: "stellar-registry/actions/.github/workflows/contract-release.yml"
+        type: string
+      stellar_cli_repo:
+        description: "owner/repo of the smart-account-signing stellar-cli fork."
+        required: false
+        default: "theahaco/stellar-cli"
+        type: string
+      stellar_cli_version:
+        description: "Fork stellar-cli version to install (matches a v<version> release)."
+        required: false
+        default: "28.0.0-aha.0"
+        type: string
+    secrets:
+      signing_key:
+        description: "S… seed of the CAP-71 delegate key that signs the publish (also the fee source)."
+        required: true
+      release_token:
+        description: "Token to download the asset and upload the receipt (usually GITHUB_TOKEN)."
+        required: true
+    outputs:
+      wasm_hash:
+        description: "sha256 of the published wasm."
+        value: ${{ jobs.publish.outputs.wasm_hash }}
+      contract_id:
+        description: "Deployed content-addressed contract id (empty when deploy=false)."
+        value: ${{ jobs.publish.outputs.contract_id }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # download the asset + upload the receipt
+    outputs:
+      wasm_hash: ${{ steps.publish.outputs.wasm_hash }}
+      contract_id: ${{ steps.deploy.outputs.contract_id }}
+    env:
+      STELLAR_NETWORK: ${{ inputs.network }}
+      STELLAR_RPC_URL: ${{ inputs.rpc_url || (inputs.network == 'mainnet' && 'https://mainnet.sorobanrpc.com' || 'https://soroban-testnet.stellar.org') }}
+      STELLAR_NETWORK_PASSPHRASE: ${{ inputs.network_passphrase || (inputs.network == 'mainnet' && 'Public Global Stellar Network ; September 2015' || 'Test SDF Network ; September 2015') }}
+      REGISTRY: ${{ inputs.registry }}
+      WASM_NAME: ${{ inputs.wasm_name }}
+      AUTHOR: ${{ inputs.author }}
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Install the smart-account-signing stellar-cli (fork)
+        env:
+          REPO: ${{ inputs.stellar_cli_repo }}
+          CLI_VERSION: ${{ inputs.stellar_cli_version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPO}/releases/download/v${CLI_VERSION}/stellar-cli-${CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "installing $url"
+          curl -fsSL "$url" -o /tmp/stellar.tar.gz
+          sudo tar -xzf /tmp/stellar.tar.gz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Download the release asset
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${{ inputs.wasm_asset }}" --dir dist
+          WASM="dist/${{ inputs.wasm_asset }}"
+          test -s "$WASM" || { echo "release asset ${{ inputs.wasm_asset }} missing" >&2; exit 1; }
+          echo "WASM=$WASM" >>"$GITHUB_ENV"
+
+      - name: Verify build provenance
+        if: ${{ inputs.verify_attestation }}
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+        # The attestation's signer is the reusable build workflow, not this repo's
+        # workflow — a reusable run's certificate job_workflow_ref points at it.
+        run: |
+          gh attestation verify "$WASM" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${{ inputs.attestation_signer_workflow }}"
+
+      - name: Cross-check wasm meta binver against the version
+        run: |
+          meta_binver=$(stellar contract info meta --wasm "$WASM" | sed -n 's/^ • binver: \(.*\)$/\1/p')
+          if [ "$meta_binver" != "$VERSION" ]; then
+            echo "version $VERSION != wasm meta binver $meta_binver" >&2
+            exit 1
+          fi
+
+      - name: Publish (upload + smart-account-signed publish_hash)
+        id: publish
+        env:
+          # Source (fee payer) and delegate signer, both from the env — never argv.
+          STELLAR_ACCOUNT: ${{ secrets.signing_key }}
+          STELLAR_SIGN_WITH_KEY: ${{ secrets.signing_key }}
+        run: |
+          set -euo pipefail
+          LOCAL_HASH=$(sha256sum "$WASM" | cut -d' ' -f1)
+          echo "wasm_hash=$LOCAL_HASH" >>"$GITHUB_OUTPUT"
+
+          # Idempotency preflight: skip a same-hash republish; a different hash
+          # under the same version is a supply-chain smell and refuses. Registry
+          # errors #1 NoSuchWasmPublished / #2 NoSuchVersion mean "not published
+          # yet" and proceed. fetch_hash's version is Option<String> → a JSON
+          # string ("1.2.3", quotes and all).
+          set +e
+          onchain=$(stellar contract invoke --id "$REGISTRY" --send=no -- \
+            fetch_hash --wasm_name "$WASM_NAME" --version "\"$VERSION\"" 2>preflight.err)
+          rc=$?
+          set -e
+          onchain=${onchain//\"/}
+          if [ "$rc" -eq 0 ]; then
+            if [ "$onchain" = "$LOCAL_HASH" ]; then
+              echo "version $VERSION already published with the same hash — skipping"
+              echo "SKIP=1" >>"$GITHUB_ENV"
+              exit 0
+            fi
+            echo "version $VERSION already on-chain with DIFFERENT hash $onchain (local $LOCAL_HASH)" >&2
+            exit 1
+          elif ! grep -qE 'Error\(Contract, #(1|2)\)' preflight.err; then
+            echo "unexpected preflight failure:" >&2; cat preflight.err >&2; exit 1
+          fi
+
+          # Install the code (any size), assert the ledger hash matches.
+          uploaded=$(stellar contract upload --wasm "$WASM")
+          if [ "$uploaded" != "$LOCAL_HASH" ]; then
+            echo "uploaded hash $uploaded != local $LOCAL_HASH" >&2; exit 1
+          fi
+
+          # Bind name→hash→author. author is the smart account (C…); its
+          # __check_auth is satisfied by the fork discovering the account's
+          # context rule and signing with STELLAR_SIGN_WITH_KEY as the delegate.
+          stellar contract invoke --id "$REGISTRY" -- \
+            publish_hash --wasm_name "$WASM_NAME" --author "$AUTHOR" \
+            --wasm_hash "$LOCAL_HASH" --version "$VERSION"
+
+      - name: Deploy the content-addressed instance
+        id: deploy
+        if: ${{ inputs.deploy && env.SKIP != '1' }}
+        env:
+          STELLAR_ACCOUNT: ${{ secrets.signing_key }}
+        run: |
+          set -euo pipefail
+          # deployer = the registry itself → address is the pure function
+          # deployer(registry, wasm_hash); redeploying identical bytes is a no-op
+          # returning the same address. version is Option<String> → JSON string.
+          addr=$(stellar contract invoke --id "$REGISTRY" -- \
+            deploy_stateless --wasm_name "$WASM_NAME" --version "\"$VERSION\"")
+          echo "contract_id=${addr//\"/}" >>"$GITHUB_OUTPUT"
+
+      - name: Attach the publish receipt to the release
+        if: ${{ env.SKIP != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+        run: |
+          jq -n \
+            --arg registry "$REGISTRY" --arg wasm_name "$WASM_NAME" \
+            --arg version "$VERSION" --arg wasm_hash "${{ steps.publish.outputs.wasm_hash }}" \
+            --arg author "$AUTHOR" --arg contract_id "${{ steps.deploy.outputs.contract_id }}" \
+            --arg network "$STELLAR_NETWORK" \
+            '$ARGS.named' >publish-receipt.json
+          gh release upload "$TAG" publish-receipt.json --clobber --repo "$GITHUB_REPOSITORY"
+          {
+            echo "### $WASM_NAME $VERSION published to $REGISTRY"
+            echo '```json'; cat publish-receipt.json; echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
