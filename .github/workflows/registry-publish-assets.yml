@@ -1,0 +1,265 @@
+name: Publish Release Assets to Registry
+
+# Reusable: download every contract wasm attached to a GitHub release, verify
+# each asset's build provenance, and publish each to a Stellar Registry with
+# the stellar-registry CLI (https://github.com/stellar-registry/cli).
+#
+# This is the classic-key batch path: the author is a G… account whose seed is
+# the `signing_key` secret (the registry requires the name's bound author to
+# sign every subsequent-version publish), and names resolve through the
+# network's verified registry — including `<channel>/<name>` sub-registry
+# names like `oz/ft-standard`. It complements registry-publish.yml, the
+# single-wasm path for smart-account (C…) authors signed via the CAP-71 fork
+# CLI against an explicit registry contract id.
+#
+# Idempotent: an asset whose (name, version) is already on-chain with the SAME
+# hash is skipped, so a rerun after a partial failure only publishes what's
+# missing; the same version with a DIFFERENT hash refuses — that's a
+# supply-chain smell, never something to clobber. One failing asset doesn't
+# abort the batch: the loop finishes the rest and the job fails at the end,
+# listing every failure.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "GitHub release tag holding the built wasm assets."
+        required: true
+        type: string
+      asset_pattern:
+        description: "Glob of release assets to download and publish."
+        required: false
+        default: "*.wasm"
+        type: string
+      name_prefix:
+        description: >-
+          Prefix for on-chain wasm names, e.g. "oz/" — the published name is
+          <name_prefix><package> where <package> comes from the asset filename
+          <package>_v<version>.wasm.
+        required: false
+        default: ""
+        type: string
+      network:
+        description: "Stellar network: testnet | mainnet."
+        required: false
+        default: testnet
+        type: string
+      rpc_url:
+        description: "Soroban RPC URL. Defaults to the public endpoint for `network`."
+        required: false
+        type: string
+      network_passphrase:
+        description: "Network passphrase. Defaults to the constant for `network`."
+        required: false
+        type: string
+      registry:
+        description: >-
+          Registry contract id (C…) override. Empty = the CLI's built-in
+          verified registry for the network.
+        required: false
+        default: ""
+        type: string
+      author:
+        description: "Author address (G…). Empty = the signing key's own account."
+        required: false
+        default: ""
+        type: string
+      verify_attestation:
+        description: "Verify each asset's GitHub build provenance before publishing."
+        required: false
+        default: true
+        type: boolean
+      attestation_signer_workflow:
+        description: >-
+          Reusable workflow that produced the attestations (for `gh attestation
+          verify --signer-workflow`). Leave empty when the assets were attested
+          by the caller repo's own workflow.
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Simulate every publish without submitting transactions."
+        required: false
+        default: false
+        type: boolean
+      inclusion_fee:
+        description: "Max inclusion fee in stroops (STELLAR_INCLUSION_FEE). Empty = CLI default."
+        required: false
+        default: ""
+        type: string
+      registry_cli_version:
+        description: "stellar-registry-cli release to install."
+        required: false
+        default: "0.1.0"
+        type: string
+      registry_cli_sha256:
+        description: >-
+          sha256 of the stellar-registry-cli x86_64-unknown-linux-gnu tarball
+          for registry_cli_version. Must be updated together with the version;
+          empty skips verification (warned).
+        required: false
+        default: "4060fae8f95955a0f2aaf62e78879bda7d002d44e951969e61467f09d8685f01"
+        type: string
+    secrets:
+      signing_key:
+        description: "S… seed that signs the publishes (fee source; must be each name's bound author unless `author` overrides)."
+        required: true
+      release_token:
+        description: "Token to download the assets and upload the receipts (usually GITHUB_TOKEN)."
+        required: true
+    outputs:
+      receipts:
+        description: "JSON array [{wasm_name, version, wasm_hash, status}] — status: published | already-published | hash-mismatch | failed."
+        value: ${{ jobs.publish.outputs.receipts }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # download the assets + upload the receipts
+    outputs:
+      receipts: ${{ steps.publish.outputs.receipts }}
+    env:
+      STELLAR_NETWORK: ${{ inputs.network }}
+      STELLAR_RPC_URL: ${{ inputs.rpc_url || (inputs.network == 'mainnet' && 'https://mainnet.sorobanrpc.com' || 'https://soroban-testnet.stellar.org') }}
+      STELLAR_NETWORK_PASSPHRASE: ${{ inputs.network_passphrase || (inputs.network == 'mainnet' && 'Public Global Stellar Network ; September 2015' || 'Test SDF Network ; September 2015') }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Install the stellar-registry CLI
+        env:
+          CLI_VERSION: ${{ inputs.registry_cli_version }}
+          CLI_SHA256: ${{ inputs.registry_cli_sha256 }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/stellar-registry/cli/releases/download/stellar-registry-cli-v${CLI_VERSION}/stellar-registry-cli-v${CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "installing $url"
+          curl -fsSL "$url" -o /tmp/srcli.tar.gz
+          if [ -n "$CLI_SHA256" ]; then
+            echo "$CLI_SHA256  /tmp/srcli.tar.gz" | sha256sum -c -
+          else
+            echo "::warning::registry_cli_sha256 is empty — skipping checksum verification"
+          fi
+          sudo tar -xzf /tmp/srcli.tar.gz -C /usr/local/bin stellar-registry
+          stellar-registry --help >/dev/null
+
+      - name: Download the release assets
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+          PATTERN: ${{ inputs.asset_pattern }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$PATTERN" --dir dist
+          shopt -s nullglob
+          wasms=(dist/*.wasm)
+          if [ "${#wasms[@]}" -eq 0 ]; then
+            echo "::error::release $TAG has no assets matching $PATTERN"
+            exit 1
+          fi
+          echo "downloaded ${#wasms[@]} wasm(s)"
+
+      - name: Verify build provenance
+        if: ${{ inputs.verify_attestation }}
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+          SIGNER_WORKFLOW: ${{ inputs.attestation_signer_workflow }}
+        run: |
+          set -euo pipefail
+          for w in dist/*.wasm; do
+            if [ -n "$SIGNER_WORKFLOW" ]; then
+              gh attestation verify "$w" --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$SIGNER_WORKFLOW"
+            else
+              gh attestation verify "$w" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+
+      - name: Publish each wasm
+        id: publish
+        env:
+          # Source (fee payer) and author-by-default, from the env — never argv.
+          STELLAR_ACCOUNT: ${{ secrets.signing_key }}
+          NAME_PREFIX: ${{ inputs.name_prefix }}
+          AUTHOR: ${{ inputs.author }}
+          REGISTRY_INPUT: ${{ inputs.registry }}
+          INCLUSION_FEE: ${{ inputs.inclusion_fee }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # The CLI reads these only when set — an empty value would be parsed,
+          # not ignored, so export conditionally.
+          if [ -n "$REGISTRY_INPUT" ]; then export STELLAR_REGISTRY_CONTRACT_ID="$REGISTRY_INPUT"; fi
+          if [ -n "$INCLUSION_FEE" ]; then export STELLAR_INCLUSION_FEE="$INCLUSION_FEE"; fi
+          EXTRA=()
+          if [ -n "$AUTHOR" ]; then EXTRA+=(--author "$AUTHOR"); fi
+          if [ "$DRY_RUN" = "true" ]; then EXTRA+=(--dry-run); fi
+
+          receipts='[]'
+          failed=""
+          for w in dist/*.wasm; do
+            f=$(basename "$w")
+            # Filename shape from the build workflows: <package>_v<version>.wasm.
+            # Strict parse — package and version reach the CLI's argv.
+            if ! [[ "$f" =~ ^([A-Za-z0-9_][A-Za-z0-9_-]*)_v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)\.wasm$ ]]; then
+              echo "::warning::skipping asset with unrecognized name shape: $f"
+              continue
+            fi
+            pkg="${BASH_REMATCH[1]}"
+            ver="${BASH_REMATCH[2]}"
+            wname="${NAME_PREFIX}${pkg}"
+            hash=$(sha256sum "$w" | cut -d' ' -f1)
+
+            # Idempotency preflight: same version + same hash on-chain = done;
+            # same version + different hash = refuse. A fetch-hash failure means
+            # "not published yet" (or a transient RPC error — the publish then
+            # fails loudly on-chain rather than clobbering anything).
+            onchain=$(stellar-registry fetch-hash "$wname" --version "$ver" 2>/dev/null) || onchain=""
+            if [ -n "$onchain" ]; then
+              if [ "$onchain" = "$hash" ]; then
+                echo "$wname v$ver already published with the same hash — skipping"
+                receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
+                  '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"already-published"}]' <<<"$receipts")
+                continue
+              fi
+              echo "::error::$wname v$ver already on-chain with DIFFERENT hash $onchain (local $hash)"
+              failed="$failed $wname@$ver"
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"hash-mismatch"}]' <<<"$receipts")
+              continue
+            fi
+
+            echo "publishing $wname v$ver ($hash)"
+            if stellar-registry publish --wasm "$w" --wasm-name "$wname" --binver "$ver" "${EXTRA[@]}"; then
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"published"}]' <<<"$receipts")
+            else
+              echo "::error::publish failed for $wname v$ver"
+              failed="$failed $wname@$ver"
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"failed"}]' <<<"$receipts")
+            fi
+          done
+
+          echo "receipts=$receipts" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Registry publish — $TAG"
+            [ "$DRY_RUN" = "true" ] && echo "_dry run — nothing submitted_"
+            echo '```json'
+            jq . <<<"$receipts"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ -n "$failed" ]; then
+            echo "::error::failed:$failed"
+            exit 1
+          fi
+
+      - name: Attach the publish receipts to the release
+        if: ${{ always() && steps.publish.outputs.receipts != '' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.release_token }}
+          RECEIPTS: ${{ steps.publish.outputs.receipts }}
+        run: |
+          set -euo pipefail
+          jq . <<<"$RECEIPTS" >registry-publish-receipts.json
+          gh release upload "$TAG" registry-publish-receipts.json --clobber \
+            --repo "$GITHUB_REPOSITORY"

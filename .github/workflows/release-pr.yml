@@ -1,0 +1,197 @@
+name: Release PR
+
+# Reusable: git-cliff-driven version bumps + changelogs, opened as a single
+# "chore: release" PR — release-plz's UX (auto semver bump from conventional
+# commits, per-contract changelog, one release PR) rebuilt on git history with
+# NO cargo packaging, so it works in workspaces whose git-only or
+# intra-workspace deps can't resolve against crates.io. Extracted from
+# stellar-registry/perch's proven release pipeline.
+#
+# Pairs with detect-releases.yml: call both on push to main. This job computes
+# each contract's next version from its conventional commits (scoped to the
+# paths it ships), bumps the manifest, regenerates the changelog, and
+# opens/updates the release PR. Merging that PR bumps the versions on main,
+# which detect-releases then tags — and your build/publish jobs pick up.
+#
+# The caller repo must contain a COMPLETE git-cliff config (a partial config
+# silently merges with git-cliff defaults — commit-type filters and heading
+# stripping behave unexpectedly). The PR is opened with GITHUB_TOKEN, so its
+# own CI checks don't run: the bumps are mechanical; real CI ran on the
+# feature PRs.
+
+on:
+  workflow_call:
+    inputs:
+      contracts:
+        description: >-
+          JSON array of release specs. Each entry:
+          {"name": "<package>",
+           "manifest": "<path>" (default "crates/<name>/Cargo.toml"),
+           "tag_prefix": "<prefix>" (default "<name>-v"),
+           "include_paths": ["<glob>", …] (default ["crates/<name>/**"] —
+             include every intra-workspace lib the contract embeds, so a lib
+             fix re-releases the contract that ships it),
+           "changelog": "<path>" (default "crates/<name>/CHANGELOG.md"),
+           "version_from": "package" | "workspace" (default "package")}.
+        required: true
+        type: string
+      cliff_config:
+        description: "Path to the caller repo's git-cliff config (must be complete, not partial)."
+        required: false
+        default: cliff.toml
+        type: string
+      pr_branch:
+        description: "Head branch for the release PR."
+        required: false
+        default: release/next
+        type: string
+      pr_title:
+        description: "Title of the release PR."
+        required: false
+        default: "chore: release"
+        type: string
+      commit_message:
+        description: "Commit message for the bump commit."
+        required: false
+        default: "chore: release — version bumps + changelogs"
+        type: string
+      git_cliff_version:
+        description: "git-cliff release to install."
+        required: false
+        default: "2.14.1"
+        type: string
+      git_cliff_sha512:
+        description: >-
+          sha512 of the git-cliff x86_64-unknown-linux-gnu tarball for
+          git_cliff_version. Must be updated together with the version.
+        required: false
+        default: "bb40f68e752db1a32526c43e0108e8eff785f7c24c67024cffe1c316e034372975fd78c9af8e9a48148235aad15c9a103f1a5b490c282f1db09a7a793794b69f"
+        type: string
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git-cliff needs full history + tags
+          persist-credentials: false # create-pull-request authenticates itself
+      - name: Install git-cliff
+        env:
+          GC_VERSION: ${{ inputs.git_cliff_version }}
+          GC_SHA512: ${{ inputs.git_cliff_sha512 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gc"
+          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${GC_VERSION}/git-cliff-${GC_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -o "$RUNNER_TEMP/gc.tar.gz"
+          echo "$GC_SHA512  $RUNNER_TEMP/gc.tar.gz" | sha512sum -c -
+          tar -xz -C "$RUNNER_TEMP/gc" --strip-components=1 -f "$RUNNER_TEMP/gc.tar.gz"
+          echo "$RUNNER_TEMP/gc" >>"$GITHUB_PATH"
+      - name: Compute version bumps + changelogs
+        id: prep
+        env:
+          CONTRACTS_JSON: ${{ inputs.contracts }}
+          CLIFF_CONFIG: ${{ inputs.cliff_config }}
+        # No `set -e`: git-cliff exits nonzero when a contract has nothing
+        # releasable, which is the common case, not an error.
+        run: |
+          set -uo pipefail
+          case "$CLIFF_CONFIG" in
+            /*|*..*) echo "::error::invalid cliff_config path '$CLIFF_CONFIG'"; exit 1;;
+          esac
+          if [ ! -f "$CLIFF_CONFIG" ]; then
+            echo "::error::git-cliff config $CLIFF_CONFIG not found in the caller repo"
+            exit 1
+          fi
+          n=$(jq length <<<"$CONTRACTS_JSON") || exit 1
+          summary=""
+          for i in $(seq 0 $((n - 1))); do
+            entry=$(jq -c ".[$i]" <<<"$CONTRACTS_JSON")
+            name=$(jq -r '.name // empty' <<<"$entry")
+            if ! [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+              echo "::error::invalid or missing contract name in $entry"
+              exit 1
+            fi
+            manifest=$(jq -r --arg d "crates/$name/Cargo.toml" '.manifest // $d' <<<"$entry")
+            case "$manifest" in
+              /*|*..*) echo "::error::invalid manifest path '$manifest'"; exit 1;;
+            esac
+            if [ ! -f "$manifest" ]; then
+              echo "::error::manifest $manifest not found"
+              exit 1
+            fi
+            prefix=$(jq -r --arg d "$name-v" '.tag_prefix // $d' <<<"$entry")
+            if ! [[ "$prefix" =~ ^[A-Za-z0-9_./-]+$ ]]; then
+              echo "::error::invalid tag_prefix '$prefix'"
+              exit 1
+            fi
+            changelog=$(jq -r --arg d "crates/$name/CHANGELOG.md" '.changelog // $d' <<<"$entry")
+            case "$changelog" in
+              /*|*..*) echo "::error::invalid changelog path '$changelog'"; exit 1;;
+            esac
+            mode=$(jq -r '.version_from // "package"' <<<"$entry")
+            case "$mode" in
+              package)   section='^\[package\]';;
+              workspace) section='^\[workspace\.package\]';;
+              *) echo "::error::invalid version_from '$mode' (package|workspace)"; exit 1;;
+            esac
+            inc=()
+            while IFS= read -r p; do
+              case "$p" in
+                /*|*..*) echo "::error::invalid include path '$p'"; exit 1;;
+              esac
+              inc+=(--include-path "$p")
+            done < <(jq -r --arg d "crates/$name/**" '(.include_paths // [$d])[]' <<<"$entry")
+
+            # feat -> minor, fix -> patch (per the caller's cliff.toml [bump]).
+            # Returns the current version when nothing is releasable.
+            next_tag=$(git cliff --config "$CLIFF_CONFIG" --tag-pattern "${prefix}.*" "${inc[@]}" --bumped-version 2>/dev/null) || true
+            next_ver=${next_tag#"$prefix"}
+            cur=$(sed -n "/$section/,/^\[/s/^version = \"\([^\"]*\)\".*/\1/p" "$manifest" | head -1)
+            [ -n "$next_ver" ] || continue
+            [ "$next_ver" != "$cur" ] || continue
+            # Only a strict increase (guards the race where detect-releases has
+            # already tagged this version on the release-PR merge push).
+            [ "$(printf '%s\n%s\n' "$cur" "$next_ver" | sort -V | tail -1)" = "$next_ver" ] || continue
+            if ! [[ "$next_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::$name: computed next version '$next_ver' is not semver"
+              exit 1
+            fi
+            sed -i "/$section/,/^\[/s|^version = \"[^\"]*\"|version = \"$next_ver\"|" "$manifest"
+            git cliff --config "$CLIFF_CONFIG" --tag-pattern "${prefix}.*" "${inc[@]}" --bump -o "$changelog" 2>/dev/null
+            summary="${summary}- \`$name\`: $cur -> $next_ver"$'\n'
+            echo "bump $name: $cur -> $next_ver"
+          done
+          if [ -n "$summary" ]; then echo "any=true" >>"$GITHUB_OUTPUT"; else echo "any=false" >>"$GITHUB_OUTPUT"; fi
+          {
+            echo "body<<__RPBODY__"
+            echo "Automated by the reusable \`release-pr\` workflow (git-cliff) — version bumps + changelogs, no cargo package."
+            echo ""
+            echo "### Contracts to release"
+            printf "%s" "${summary:-_none_}"
+            echo ""
+            echo ""
+            echo "Merging bumps the versions on main; \`detect-releases\` then tags them."
+            echo "__RPBODY__"
+          } >>"$GITHUB_OUTPUT"
+      - name: Open / update the release PR
+        if: steps.prep.outputs.any == 'true'
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: ${{ inputs.pr_branch }}
+          delete-branch: true
+          title: ${{ inputs.pr_title }}
+          commit-message: ${{ inputs.commit_message }}
+          body: ${{ steps.prep.outputs.body }}
+      - name: Close the release PR when nothing is pending
+        if: steps.prep.outputs.any != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          pr=$(gh pr list --head "$PR_BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$pr" ]; then gh pr close "$pr" --delete-branch --comment "No releasable changes remain." || true; fi
