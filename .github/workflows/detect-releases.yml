@@ -1,0 +1,125 @@
+name: Detect Releases
+
+# Reusable: tag-on-manifest-bump release detection — pure git, no cargo
+# packaging. A contract is "released" when its manifest `version` has no
+# matching `<tag_prefix><version>` tag yet (i.e. someone bumped it in a merged
+# PR); this job then creates and pushes that tag and reports it.
+#
+# Built for repos whose releases are on-chain wasm publishes rather than
+# crates.io: release-plz-style `cargo package` change-detection cannot resolve
+# git-only or intra-workspace path deps against the crates.io index (and
+# packages immutable historical tags as its diff baseline), so detection here
+# is a version-vs-tag comparison only. Extracted from stellar-registry/perch's
+# proven release pipeline.
+#
+# Call it on push to main and hang the build/publish jobs off its outputs with
+# `needs:` in the SAME run — tags pushed with the default GITHUB_TOKEN do not
+# retrigger workflows, so a tag-triggered pipeline would need a GitHub App;
+# this shape needs nothing.
+
+on:
+  workflow_call:
+    inputs:
+      contracts:
+        description: >-
+          JSON array of release specs. Each entry:
+          {"name": "<package>",
+           "manifest": "<path to Cargo.toml>" (default "crates/<name>/Cargo.toml"),
+           "tag_prefix": "<prefix>" (default "<name>-v"),
+           "version_from": "package" | "workspace" (default "package")}.
+          "workspace" reads the version from the manifest's
+          [workspace.package] section (single-version workspaces — use e.g.
+          tag_prefix "v"); "package" reads it from [package].
+        required: true
+        type: string
+    outputs:
+      releases_created:
+        description: "'true' when at least one tag was created this run."
+        value: ${{ jobs.detect.outputs.releases_created }}
+      releases:
+        description: >-
+          JSON array [{package_name, tag, version}] of the releases tagged this
+          run (empty array when nothing was bumped).
+        value: ${{ jobs.detect.outputs.releases }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create + push the per-contract release tags
+    outputs:
+      releases_created: ${{ steps.detect.outputs.releases_created }}
+      releases: ${{ steps.detect.outputs.releases }}
+    steps:
+      # Persisted default-token credentials are exactly what pushes the tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+        with:
+          fetch-depth: 0 # full tag history for the version-vs-tag comparison
+      - name: Tag manifests whose version has no matching tag
+        id: detect
+        env:
+          CONTRACTS_JSON: ${{ inputs.contracts }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          releases='[]'
+          n=$(jq length <<<"$CONTRACTS_JSON")
+          for i in $(seq 0 $((n - 1))); do
+            entry=$(jq -c ".[$i]" <<<"$CONTRACTS_JSON")
+
+            # Everything parsed here later reaches `git` argv and downstream
+            # `run:` shells via the releases output — validate strictly.
+            name=$(jq -r '.name // empty' <<<"$entry")
+            if ! [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+              echo "::error::invalid or missing contract name in $entry"
+              exit 1
+            fi
+            manifest=$(jq -r --arg d "crates/$name/Cargo.toml" '.manifest // $d' <<<"$entry")
+            case "$manifest" in
+              /*|*..*) echo "::error::invalid manifest path '$manifest'"; exit 1;;
+            esac
+            if [ ! -f "$manifest" ]; then
+              echo "::error::manifest $manifest not found"
+              exit 1
+            fi
+            prefix=$(jq -r --arg d "$name-v" '.tag_prefix // $d' <<<"$entry")
+            if ! [[ "$prefix" =~ ^[A-Za-z0-9_./-]+$ ]]; then
+              echo "::error::invalid tag_prefix '$prefix'"
+              exit 1
+            fi
+            mode=$(jq -r '.version_from // "package"' <<<"$entry")
+            case "$mode" in
+              package)   ver=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)".*/\1/p' "$manifest" | head -1);;
+              workspace) ver=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)".*/\1/p' "$manifest" | head -1);;
+              *) echo "::error::invalid version_from '$mode' (package|workspace)"; exit 1;;
+            esac
+            if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::$name: version '$ver' from $manifest is not semver"
+              exit 1
+            fi
+
+            tag="$prefix$ver"
+            # Already released? (tag exists) — skip.
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then continue; fi
+            # Guard against a downgrade: never tag a version <= the highest existing tag.
+            last=$(git tag -l "${prefix}*" | sed "s|^${prefix}||" | sort -V | tail -1)
+            if [ -n "$last" ] && [ "$(printf '%s\n%s\n' "$ver" "$last" | sort -V | tail -1)" != "$ver" ]; then
+              echo "::warning::$name manifest version $ver is not greater than last tag $last — skipping"
+              continue
+            fi
+            git tag "$tag"
+            git push origin "$tag"
+            releases=$(jq -c --arg p "$name" --arg t "$tag" --arg v "$ver" \
+              '. + [{package_name:$p, tag:$t, version:$v}]' <<<"$releases")
+            echo "released $tag"
+          done
+          {
+            echo "releases=$releases"
+            cnt=$(jq length <<<"$releases")
+            echo "releases_created=$([ "$cnt" -gt 0 ] && echo true || echo false)"
+          } >>"$GITHUB_OUTPUT"
+          {
+            echo "### Released this run"
+            jq -r 'if length==0 then "_none — no version bumped past its tag_" else (.[] | "- \(.tag)") end' <<<"$releases"
+          } >>"$GITHUB_STEP_SUMMARY"
