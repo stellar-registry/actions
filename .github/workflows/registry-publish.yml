@@ -66,7 +66,6 @@ on:
         description: >-
           Largest wasm published with a single `publish` call; bigger ones use
           `contract upload` + `publish_hash`. 0 = always upload + publish_hash
-          (the behaviour before this input existed).
         required: false
         default: 61440
         type: number
