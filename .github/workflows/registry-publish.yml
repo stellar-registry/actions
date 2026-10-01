@@ -12,9 +12,15 @@ name: Publish to Registry
 # account's context rule on-chain and signs with `--sign-with-key`. No
 # smart-account-specific flags, and no project-specific signer binary.
 #
-# Every wasm goes on-chain as `contract upload` (installs the code, any size) +
-# `registry.publish_hash` (binds name→hash→author, smart-account-signed), so the
-# same path works for small and large (>48 KiB) contracts alike.
+# A wasm that fits goes on-chain in ONE smart-account-signed
+# `registry.publish(name, author, wasm, version)`: the author's signature then
+# covers the code itself, and the author's policy only has to allow `publish`.
+# The wasm bytes ride in that transaction twice (the argument, and again inside
+# the author's signed auth entry), and the network caps a transaction at
+# 132096 bytes, so a wasm over `publish_max_wasm_bytes` falls back to
+# `contract upload` (installs the code, any size) + `registry.publish_hash`
+# (binds name→hash→author). The author's policy must allow `publish_hash`
+# too for that fallback.
 
 on:
   workflow_call:
@@ -56,6 +62,13 @@ on:
         description: "Network passphrase. Defaults to the constant for `network`."
         required: false
         type: string
+      publish_max_wasm_bytes:
+        description: >-
+          Largest wasm published with a single `publish` call; bigger ones use
+          `contract upload` + `publish_hash`. 0 = always upload + publish_hash
+        required: false
+        default: 61440
+        type: number
       deploy:
         description: "Also `deploy_stateless` the published wasm (content-addressed)."
         required: false
@@ -155,12 +168,13 @@ jobs:
             exit 1
           fi
 
-      - name: Publish (upload + smart-account-signed publish_hash)
+      - name: Publish (smart-account-signed publish, or upload + publish_hash)
         id: publish
         env:
           # Source (fee payer) and delegate signer, both from the env — never argv.
           STELLAR_ACCOUNT: ${{ secrets.signing_key }}
           STELLAR_SIGN_WITH_KEY: ${{ secrets.signing_key }}
+          MAX_WASM: ${{ inputs.publish_max_wasm_bytes }}
         run: |
           set -euo pipefail
           LOCAL_HASH=$(sha256sum "$WASM" | cut -d' ' -f1)
@@ -189,18 +203,35 @@ jobs:
             echo "unexpected preflight failure:" >&2; cat preflight.err >&2; exit 1
           fi
 
-          # Install the code (any size), assert the ledger hash matches.
-          uploaded=$(stellar contract upload --wasm "$WASM")
-          if [ "$uploaded" != "$LOCAL_HASH" ]; then
-            echo "uploaded hash $uploaded != local $LOCAL_HASH" >&2; exit 1
+          # author is the smart account (C…); its __check_auth is satisfied by
+          # the fork discovering the account's context rule and signing with
+          # STELLAR_SIGN_WITH_KEY.
+          size=$(stat -c%s "$WASM")
+          if [ "$MAX_WASM" -gt 0 ] && [ "$size" -le "$MAX_WASM" ]; then
+            # One transaction: the registry uploads the bytes itself and binds
+            # name→hash→author; the author's signature covers the code.
+            echo "method=publish" >>"$GITHUB_OUTPUT"
+            stellar contract invoke --id "$REGISTRY" -- \
+              publish --wasm_name "$WASM_NAME" --author "$AUTHOR" \
+              --wasm-file-path "$WASM" --version "$VERSION"
+            onchain=$(stellar contract invoke --id "$REGISTRY" --send=no -- \
+              fetch_hash --wasm_name "$WASM_NAME" --version "\"$VERSION\"")
+            if [ "${onchain//\"/}" != "$LOCAL_HASH" ]; then
+              echo "published hash ${onchain//\"/} != local $LOCAL_HASH" >&2; exit 1
+            fi
+          else
+            # Too big for one transaction: install the code (any size), assert
+            # the ledger hash matches, then bind name→hash→author.
+            echo "method=publish_hash" >>"$GITHUB_OUTPUT"
+            echo "wasm is $size bytes (> $MAX_WASM): upload + publish_hash"
+            uploaded=$(stellar contract upload --wasm "$WASM")
+            if [ "$uploaded" != "$LOCAL_HASH" ]; then
+              echo "uploaded hash $uploaded != local $LOCAL_HASH" >&2; exit 1
+            fi
+            stellar contract invoke --id "$REGISTRY" -- \
+              publish_hash --wasm_name "$WASM_NAME" --author "$AUTHOR" \
+              --wasm_hash "$LOCAL_HASH" --version "$VERSION"
           fi
-
-          # Bind name→hash→author. author is the smart account (C…); its
-          # __check_auth is satisfied by the fork discovering the account's
-          # context rule and signing with STELLAR_SIGN_WITH_KEY as the delegate.
-          stellar contract invoke --id "$REGISTRY" -- \
-            publish_hash --wasm_name "$WASM_NAME" --author "$AUTHOR" \
-            --wasm_hash "$LOCAL_HASH" --version "$VERSION"
 
       - name: Deploy the content-addressed instance
         id: deploy
@@ -225,7 +256,7 @@ jobs:
             --arg registry "$REGISTRY" --arg wasm_name "$WASM_NAME" \
             --arg version "$VERSION" --arg wasm_hash "${{ steps.publish.outputs.wasm_hash }}" \
             --arg author "$AUTHOR" --arg contract_id "${{ steps.deploy.outputs.contract_id }}" \
-            --arg network "$STELLAR_NETWORK" \
+            --arg network "$STELLAR_NETWORK" --arg method "${{ steps.publish.outputs.method }}" \
             '$ARGS.named' >publish-receipt.json
           gh release upload "$TAG" publish-receipt.json --clobber --repo "$GITHUB_REPOSITORY"
           {

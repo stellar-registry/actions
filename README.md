@@ -105,10 +105,15 @@ build:
 On-chain publish of a **single** wasm to an **explicit registry contract id**,
 authored by a **smart account** (C…): downloads the release asset, verifies
 its provenance (`gh attestation verify --signer-workflow`), cross-checks the
-wasm's `binver` metadata, then `contract upload` + smart-account-signed
-`publish_hash` (+ optional content-addressed `deploy_stateless`) via the
+wasm's `binver` metadata, then publishes with a smart-account-signed
+`publish` (the author's signature covers the wasm bytes) via the
 CAP-71-signing [theahaco/stellar-cli](https://github.com/theahaco/stellar-cli)
-fork. Attaches a publish receipt to the release.
+fork. A wasm over `publish_max_wasm_bytes` (default 61440) doesn't fit in one
+transaction that way, so it falls back to `contract upload` + a
+smart-account-signed `publish_hash`; the author's policy must allow `publish`,
+plus `publish_hash` if any wasm can exceed the limit. Optionally
+`deploy_stateless`s the result (content-addressed registries). Attaches a
+publish receipt, which records the method used, to the release.
 
 ```yaml
 publish:
