@@ -100,6 +100,24 @@ build:
     release_token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+The toolchain is pinned, so the same commit built through the same workflow
+sha gives the same bytes (on the same host platform: x86_64 Linux, which this
+workflow runs on; a macOS arm64 build of the same inputs can differ):
+
+| Tool | Version used | Default |
+| --- | --- | --- |
+| rustc | the repo's `rust-toolchain.toml` / `rust-toolchain` channel if it is concrete (`1.99.0`, `nightly-2026-01-01`), else the `rust_toolchain` input | `1.99.0` |
+| stellar-scaffold-cli (`stellar scaffold build`) | `scaffold_version` | `0.0.27` |
+| stellar-cli (`stellar contract optimize`) | `stellar_cli_version` | `26.0.0` |
+
+A floating channel in the toolchain file (`stable`, `1.99`) doesn't fail the
+build: it's overridden by `rust_toolchain` with a warning. Pin the file to a
+concrete version so local builds use the same compiler as CI. rustc and
+scaffold versions are embedded in the wasm's meta (`rsver`,
+`scaffold_version`, plus the `cliver` of the stellar-cli library scaffold
+links), so any change to them changes the hash. The job summary lists the
+versions each build used.
+
 ### `registry-publish.yml`
 
 On-chain publish of a **single** wasm to an **explicit registry contract id**,
