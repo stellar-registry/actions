@@ -1,5 +1,24 @@
 name: Build and Release Contract
 
+# Reusable: attested build of one Soroban contract — `stellar scaffold build`,
+# `stellar contract optimize`, a GitHub release holding the wasm, and a build
+# provenance attestation for it.
+#
+# The toolchain is pinned so a given (caller commit, this workflow's sha)
+# always builds the same bytes. Every tool that shapes the wasm is a concrete
+# version, never a floating channel:
+#   - rustc: the caller's rust-toolchain.toml (or legacy rust-toolchain) when
+#     it names a concrete version (1.99.0, nightly-2026-01-01); otherwise the
+#     `rust_toolchain` input. A floating channel in the file (stable, 1.99) is
+#     overridden with a warning. The choice is exported as RUSTUP_TOOLCHAIN,
+#     which outranks any toolchain file.
+#   - stellar-scaffold-cli (`scaffold_version`): drives the build and embeds
+#     its version, and the stellar-cli library version it links, as wasm meta.
+#   - stellar-cli (`stellar_cli_version`): runs `contract optimize`.
+# The defaults are what built perch's tier-0 releases of 2026-10-09/12
+# (rsver 1.99.0, scaffold_version 0.0.27, stellar 26.0.0), so a recovery-stack
+# pin chain built with them lines up with those published hashes.
+
 on:
   workflow_call:
     inputs:
@@ -31,6 +50,23 @@ on:
         description: "Home domain"
         required: false
         type: string
+      rust_toolchain:
+        description: >-
+          Concrete Rust toolchain (X.Y.Z, or <channel>-YYYY-MM-DD) used when the
+          repo's rust-toolchain.toml doesn't name a concrete version itself.
+        required: false
+        default: "1.99.0"
+        type: string
+      stellar_cli_version:
+        description: "Exact stellar-cli release to install (runs `stellar contract optimize`)."
+        required: false
+        default: "26.0.0"
+        type: string
+      scaffold_version:
+        description: "Exact stellar-scaffold-cli release to install (runs `stellar scaffold build`)."
+        required: false
+        default: "0.0.27"
+        type: string
     secrets:
       release_token:
         description: "Github token"
@@ -45,42 +81,124 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: cargo-bins/cargo-binstall@main
+      - name: Validate tool versions
+        env:
+          RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+          STELLAR_CLI_VERSION: ${{ inputs.stellar_cli_version }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+        run: |
+          set -euo pipefail
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          dated='^(stable|beta|nightly)-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          if ! [[ "$RUST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$RUST_TOOLCHAIN" =~ $dated ]]; then
+            echo "::error::rust_toolchain '$RUST_TOOLCHAIN' is not concrete (X.Y.Z or <channel>-YYYY-MM-DD)"
+            exit 1
+          fi
+          for v in "$STELLAR_CLI_VERSION" "$SCAFFOLD_VERSION"; do
+            if ! [[ "$v" =~ $semver ]]; then
+              echo "::error::'$v' is not an exact version"
+              exit 1
+            fi
+          done
+
+      - uses: cargo-bins/cargo-binstall@3be4ad2b146f3302f92e5956c54fedbb6ae8cccc # v1.25.3
+        with:
+          version: 1.25.3
       - name: install scaffold-stellar
-        run: cargo binstall -y stellar-scaffold-cli
+        env:
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+        run: |
+          set -euo pipefail
+          cargo binstall -y --locked --version "=$SCAFFOLD_VERSION" stellar-scaffold-cli
+          stellar-scaffold --version
       - name: Set working directory
         run: |
           RANDOM_DIR=$(openssl rand -hex 8)
-          WORK_DIR="${{ github.workspace }}/$RANDOM_DIR"
+          WORK_DIR="$GITHUB_WORKSPACE/$RANDOM_DIR"
           mkdir -p "$WORK_DIR"
-          echo "WORK_DIR=$WORK_DIR" >> $GITHUB_ENV
+          {
+            echo "WORK_DIR=$WORK_DIR"
+            echo "CHECKOUT_DIR=$WORK_DIR"
+          } >>"$GITHUB_ENV"
           echo "Using working directory: $WORK_DIR"
 
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: ${{ env.WORK_DIR }}
+          persist-credentials: false
 
       - name: Set relative path
+        env:
+          RELATIVE_PATH: ${{ inputs.relative_path }}
         run: |
           # Set relative path after checking out the code
-          if [ "${{ inputs.relative_path }}" ]; then
-            WORK_DIR="$WORK_DIR/${{ inputs.relative_path }}"
-            echo "WORK_DIR=$WORK_DIR" >> $GITHUB_ENV
+          if [ -n "$RELATIVE_PATH" ]; then
+            WORK_DIR="$WORK_DIR/$RELATIVE_PATH"
+            echo "WORK_DIR=$WORK_DIR" >>"$GITHUB_ENV"
             echo "Using relative path: $WORK_DIR"
+          fi
+
+      - name: Install the pinned Rust toolchain
+        working-directory: ${{ env.WORK_DIR }}
+        env:
+          RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+        run: |
+          set -euo pipefail
+          concrete='^([0-9]+\.[0-9]+\.[0-9]+|(stable|beta|nightly)-[0-9]{4}-[0-9]{2}-[0-9]{2})$'
+
+          # The toolchain file rustup would honor: nearest to the build dir,
+          # walking up to the checkout root; `rust-toolchain` beats
+          # `rust-toolchain.toml` in the same dir, as in rustup.
+          file=""
+          dir="$WORK_DIR"
+          while [ -z "$file" ]; do
+            for f in rust-toolchain rust-toolchain.toml; do
+              if [ -f "$dir/$f" ]; then file="$dir/$f"; break; fi
+            done
+            if [ "$dir" = "$CHECKOUT_DIR" ] || [ "$dir" = / ]; then break; fi
+            dir=$(dirname "$dir")
+          done
+
+          channel=""
+          if [ -n "$file" ]; then
+            if grep -q '^[[:space:]]*\[toolchain\]' "$file"; then
+              channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n1)
+            else
+              channel=$(grep -v '^[[:space:]]*$' "$file" | head -n1 | tr -d '[:space:]')
+            fi
+          fi
+
+          rel=${file#"$CHECKOUT_DIR"/}
+          if [ -n "$file" ] && [[ "$channel" =~ $concrete ]]; then
+            toolchain="$channel"
+            echo "using $toolchain from $rel"
+          else
+            toolchain="$RUST_TOOLCHAIN"
+            if [ -n "$file" ]; then
+              echo "::warning title=Floating Rust toolchain::$rel names '${channel:-no channel}', not a concrete version; building with rust_toolchain $toolchain instead. Pin channel = \"X.Y.Z\" there so local and CI builds agree."
+            fi
+            echo "using $toolchain from the rust_toolchain input"
+          fi
+
+          rustup toolchain install "$toolchain" --profile minimal --target wasm32v1-none --no-self-update
+          # RUSTUP_TOOLCHAIN outranks any toolchain file for every later step.
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >>"$GITHUB_ENV"
+          actual=$(RUSTUP_TOOLCHAIN="$toolchain" rustc --version)
+          echo "$actual"
+          if [[ "$toolchain" =~ ^[0-9] ]] && [[ "$actual" != "rustc $toolchain "* ]]; then
+            echo "::error::expected rustc $toolchain, got: $actual"
+            exit 1
           fi
 
       - name: Run Make (if applicable)
         if: inputs.make_target != ''
         working-directory: ${{ env.WORK_DIR }}
+        env:
+          MAKE_TARGET: ${{ inputs.make_target }}
         run: |
-          make ${{ inputs.make_target }}
-
-      - name: Update Rust and Add wasm32 Target
-        working-directory: ${{ env.WORK_DIR }}
-        run: |
-          rustup update
-          rustup target add wasm32v1-none
+          read -ra targets <<<"$MAKE_TARGET"
+          make "${targets[@]}"
 
       - name: Print versions
         run: |
@@ -98,99 +216,95 @@ jobs:
             exit 1
           fi
           CARGO_METADATA=$(cargo metadata --format-version=1 --no-deps)
-          echo "CARGO_METADATA=$CARGO_METADATA" >> $GITHUB_ENV
+          echo "CARGO_METADATA=$CARGO_METADATA" >>"$GITHUB_ENV"
 
       - name: Set output directory path
         run: |
           RANDOM_DIR=$(openssl rand -hex 8)
           OUTPUT="$WORK_DIR/$RANDOM_DIR"
-          echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
+          echo "OUTPUT=$OUTPUT" >>"$GITHUB_ENV"
 
-      - name: Build contract
-        uses: stellar/stellar-cli@v26.0.0
+      - name: Install stellar-cli
+        uses: stellar/stellar-cli@60f7458e7ecffddf2f2d91dc6d0d2db4fab03ecc # v26.0.0
         with:
-          version: "26.0.0"
-      - run: |
-          # Navigate to the working directory
-          cd ${WORK_DIR}
-
+          # The action installs (and attestation-verifies) this release; without
+          # it, it would derive the version from the ref, which is a sha here.
+          version: ${{ inputs.stellar_cli_version }}
+      - name: Build contract
+        working-directory: ${{ env.WORK_DIR }}
+        env:
+          PACKAGE: ${{ inputs.package }}
+          HOME_DOMAIN: ${{ inputs.home_domain }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
           # Build command arguments
-          COMMAND_ARGS="--out-dir ${OUTPUT} --meta source_repo=github:${{ github.repository }}"
-          if [ "${{ inputs.package }}" ]; then
-              COMMAND_ARGS="--package ${{ inputs.package }} $COMMAND_ARGS"
-              PACKAGE_NAME=${{ inputs.package }}
+          args=(--profile "${PROFILE:-release}")
+          if [ -n "$PACKAGE" ]; then
+            args+=(--package "$PACKAGE")
+            PACKAGE_NAME="$PACKAGE"
           else
-              PACKAGE_NAME=$(grep -m1 '^name =' Cargo.toml | cut -d '"' -f2)
+            PACKAGE_NAME=$(grep -m1 '^name =' Cargo.toml | cut -d '"' -f2)
           fi
-          if [ "${{ inputs.home_domain }}" ]; then
-            COMMAND_ARGS="$COMMAND_ARGS --meta home_domain=${{ inputs.home_domain }}"
-          fi
-
-          if [ "${{ inputs.profile }}" ]; then
-              COMMAND_ARGS="--profile ${{ inputs.profile }} $COMMAND_ARGS"
-          else
-              COMMAND_ARGS="--profile release $COMMAND_ARGS"  
+          args+=(--out-dir "$OUTPUT" --meta "source_repo=github:$GITHUB_REPOSITORY")
+          if [ -n "$HOME_DOMAIN" ]; then
+            args+=(--meta "home_domain=$HOME_DOMAIN")
           fi
 
           # Build the contract
-          stellar scaffold build $COMMAND_ARGS
+          stellar scaffold build "${args[@]}"
 
           # Get the package version
-          PACKAGE_VERSION=$(echo "$CARGO_METADATA" | jq '.packages[] | select(.name == "'"${PACKAGE_NAME}"'") | .version' | sed -e 's/"//g')
+          PACKAGE_VERSION=$(jq -r --arg p "$PACKAGE_NAME" '.packages[] | select(.name == $p) | .version' <<<"$CARGO_METADATA")
           if [ -z "$PACKAGE_VERSION" ]; then
-              echo "ERROR: Failed to get the package version"
-              exit 1
+            echo "ERROR: Failed to get the package version"
+            exit 1
           fi
 
           # Build the wasm file name
           WASM_FILE_NAME="${PACKAGE_NAME}_v${PACKAGE_VERSION}.wasm"
 
           # Navigate to the output directory
-          cd ${OUTPUT}
+          cd "$OUTPUT"
 
-          # Find the .wasm file and copy it as unoptimized.wasm for hash calculation
-          find ${OUTPUT} -name "*.wasm" -exec cp {} ${WASM_FILE_NAME} \;
-          stellar contract optimize --wasm ${WASM_FILE_NAME} --wasm-out ${WASM_FILE_NAME}
+          # Copy the built .wasm to its release name, then optimize it in place
+          find "$OUTPUT" -name "*.wasm" -exec cp {} "$WASM_FILE_NAME" \;
+          stellar contract optimize --wasm "$WASM_FILE_NAME" --wasm-out "$WASM_FILE_NAME"
 
           # Calculate the hash of the wasm file
-          WASM_HASH=$(sha256sum $WASM_FILE_NAME | cut -d ' ' -f 1)
+          WASM_HASH=$(sha256sum "$WASM_FILE_NAME" | cut -d ' ' -f 1)
 
           # Set environment variables
-          echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> $GITHUB_ENV
-          echo "WASM_FILE_NAME=$WASM_FILE_NAME" >> $GITHUB_ENV
-          echo "WASM_HASH=$WASM_HASH" >> $GITHUB_ENV
-          echo "PACKAGE_NAME=$PACKAGE_NAME" >> $GITHUB_ENV
-          echo "BUILD_INFO=$BUILD_INFO" >> $GITHUB_ENV
-
-      - name: Build release name
-        run: |
-          CLI_VERSION=$(stellar --version | grep -oP 'stellar \K\S+')
-          if [ -n "${{ inputs.relative_path }}" ]; then
-            relative_path=$(echo "_${{ inputs.relative_path }}" | sed 's/\W\+/_/g')
-          fi
-
-          # Check if the release_name input is equal to PACKAGE_VERSION
-          if [ "${{ inputs.release_name }}" != "${PACKAGE_VERSION}" ] && [ "${{ inputs.release_name }}" != "v${PACKAGE_VERSION}" ]; then
-            pkg_version="_pkg${PACKAGE_VERSION}"
-          else
-            pkg_version=""
-          fi
-
-          TAG_NAME="${{ inputs.release_name }}"
-          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          {
+            echo "PACKAGE_VERSION=$PACKAGE_VERSION"
+            echo "WASM_FILE_NAME=$WASM_FILE_NAME"
+            echo "WASM_HASH=$WASM_HASH"
+            echo "PACKAGE_NAME=$PACKAGE_NAME"
+          } >>"$GITHUB_ENV"
+          {
+            echo "### $WASM_FILE_NAME"
+            echo "sha256 \`$WASM_HASH\`, built with:"
+            echo '```'
+            rustc --version
+            stellar --version | head -n1
+            stellar-scaffold --version
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Create release
         working-directory: ${{ env.OUTPUT }}
         env:
           GH_TOKEN: ${{ secrets.release_token }}
+          TAG_NAME: ${{ inputs.release_name }}
+          NOTES: ${{ inputs.release_description }}
         run: |
-          gh release create "${{ env.TAG_NAME }}" "${{ env.OUTPUT }}/${{ env.WASM_FILE_NAME }}" \
-            --title "${{ env.TAG_NAME }}" \
-            --notes "${{ inputs.release_description }}"
+          gh release create "$TAG_NAME" "$OUTPUT/$WASM_FILE_NAME" \
+            --title "$TAG_NAME" \
+            --notes "$NOTES"
         shell: bash
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "14"
 
@@ -203,7 +317,7 @@ jobs:
             package: (process.env.PACKAGE || undefined),
             make: (process.env.MAKE || undefined)
           }))")
-          echo "WASM_OUTPUT='$JSON_OUTPUT'" >> $GITHUB_ENV
+          echo "WASM_OUTPUT=$JSON_OUTPUT" >>"$GITHUB_ENV"
         env:
           REL_PATH: ${{ inputs.relative_path }}
           PACKAGE: ${{ inputs.package }}
@@ -212,7 +326,7 @@ jobs:
           WASM: ${{ env.WASM_FILE_NAME }}
 
       - name: Output WASM ${{ env.WASM_OUTPUT }}
-        run: echo ${{ env.WASM_OUTPUT }}
+        run: echo "$WASM_OUTPUT"
 
       - name: Send release info
         run: |
@@ -244,7 +358,7 @@ jobs:
           MAKE_TARGET: ${{ inputs.make_target }}
 
       - name: Attest
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: "${{ env.OUTPUT }}/${{ env.WASM_FILE_NAME }}"
           subject-name: "${{ env.WASM_FILE_NAME }}"

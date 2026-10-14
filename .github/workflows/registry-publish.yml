@@ -21,6 +21,24 @@ name: Publish to Registry
 # `contract upload` (installs the code, any size) + `registry.publish_hash`
 # (binds name→hash→author). The author's policy must allow `publish_hash`
 # too for that fallback.
+#
+# Signing key from a GitHub environment: a job that calls a reusable workflow
+# can't set `environment:`, so set the `environment` input instead; the
+# publish job then runs in that environment. Pass the key as usual, naming the
+# environment secret:
+#
+#   with:    { environment: testnet, ... }
+#   secrets: { signing_key: ${{ secrets.CI_PUBLISH_SECRET_KEY }}, ... }
+#
+# GitHub resolves that reference in the job that sets `environment`, so it
+# reads the environment's CI_PUBLISH_SECRET_KEY even when the secret exists only
+# there, and an environment secret beats a repo/org secret of the same name
+# (docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows,
+# "Using inputs and secrets in a reusable workflow"). A reference that resolves
+# to nothing arrives as an empty string with no error, so the job checks for
+# that before touching the network. Don't create a secret literally named
+# SIGNING_KEY or RELEASE_TOKEN: those are this workflow's own parameter names,
+# and the docs don't say whether an environment secret would shadow them.
 
 on:
   workflow_call:
@@ -94,6 +112,13 @@ on:
         required: false
         default: "28.0.0-aha.0"
         type: string
+      environment:
+        description: >-
+          GitHub environment the publish job runs in, so `signing_key` can name
+          one of its secrets. Empty = no environment.
+        required: false
+        default: ""
+        type: string
     secrets:
       signing_key:
         description: "S… seed of the CAP-71 delegate key that signs the publish (also the fee source)."
@@ -112,6 +137,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # An empty name means no environment.
+    environment: ${{ inputs.environment }}
     permissions:
       contents: write # download the asset + upload the receipt
     outputs:
@@ -127,6 +154,16 @@ jobs:
       VERSION: ${{ inputs.version }}
       TAG: ${{ inputs.release_tag }}
     steps:
+      - name: Check the signing key resolved
+        env:
+          SIGNING_KEY: ${{ secrets.signing_key }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::signing_key resolved to an empty string (environment: ${ENVIRONMENT:-none}); the secret the caller names must exist where this job can read it" >&2
+            exit 1
+          fi
+
       - name: Install the smart-account-signing stellar-cli (fork)
         env:
           REPO: ${{ inputs.stellar_cli_repo }}
@@ -142,23 +179,25 @@ jobs:
       - name: Download the release asset
         env:
           GH_TOKEN: ${{ secrets.release_token }}
+          WASM_ASSET: ${{ inputs.wasm_asset }}
         run: |
           set -euo pipefail
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "${{ inputs.wasm_asset }}" --dir dist
-          WASM="dist/${{ inputs.wasm_asset }}"
-          test -s "$WASM" || { echo "release asset ${{ inputs.wasm_asset }} missing" >&2; exit 1; }
+            --pattern "$WASM_ASSET" --dir dist
+          WASM="dist/$WASM_ASSET"
+          test -s "$WASM" || { echo "release asset $WASM_ASSET missing" >&2; exit 1; }
           echo "WASM=$WASM" >>"$GITHUB_ENV"
 
       - name: Verify build provenance
         if: ${{ inputs.verify_attestation }}
         env:
           GH_TOKEN: ${{ secrets.release_token }}
+          SIGNER_WORKFLOW: ${{ inputs.attestation_signer_workflow }}
         # The attestation's signer is the reusable build workflow, not this repo's
         # workflow — a reusable run's certificate job_workflow_ref points at it.
         run: |
           gh attestation verify "$WASM" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "${{ inputs.attestation_signer_workflow }}"
+            --signer-workflow "$SIGNER_WORKFLOW"
 
       - name: Cross-check wasm meta binver against the version
         run: |
@@ -251,12 +290,15 @@ jobs:
         if: ${{ env.SKIP != '1' }}
         env:
           GH_TOKEN: ${{ secrets.release_token }}
+          WASM_HASH: ${{ steps.publish.outputs.wasm_hash }}
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          METHOD: ${{ steps.publish.outputs.method }}
         run: |
           jq -n \
             --arg registry "$REGISTRY" --arg wasm_name "$WASM_NAME" \
-            --arg version "$VERSION" --arg wasm_hash "${{ steps.publish.outputs.wasm_hash }}" \
-            --arg author "$AUTHOR" --arg contract_id "${{ steps.deploy.outputs.contract_id }}" \
-            --arg network "$STELLAR_NETWORK" --arg method "${{ steps.publish.outputs.method }}" \
+            --arg version "$VERSION" --arg wasm_hash "$WASM_HASH" \
+            --arg author "$AUTHOR" --arg contract_id "$CONTRACT_ID" \
+            --arg network "$STELLAR_NETWORK" --arg method "$METHOD" \
             '$ARGS.named' >publish-receipt.json
           gh release upload "$TAG" publish-receipt.json --clobber --repo "$GITHUB_REPOSITORY"
           {
