@@ -18,6 +18,11 @@ name: Publish Release Assets to Registry
 # supply-chain smell, never something to clobber. One failing asset doesn't
 # abort the batch: the loop finishes the rest and the job fails at the end,
 # listing every failure.
+#
+# Signing key from a GitHub environment: set the `environment` input (a caller
+# job can't set `environment:` itself) and pass `signing_key` naming the
+# environment secret; GitHub resolves it in the publish job, which runs in that
+# environment. See registry-publish.yml for the full rules.
 
 on:
   workflow_call:
@@ -100,6 +105,13 @@ on:
         required: false
         default: "4060fae8f95955a0f2aaf62e78879bda7d002d44e951969e61467f09d8685f01"
         type: string
+      environment:
+        description: >-
+          GitHub environment the publish job runs in, so `signing_key` can name
+          one of its secrets. Empty = no environment.
+        required: false
+        default: ""
+        type: string
     secrets:
       signing_key:
         description: "S… seed that signs the publishes (fee source; must be each name's bound author unless `author` overrides)."
@@ -115,6 +127,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # An empty name means no environment.
+    environment: ${{ inputs.environment }}
     permissions:
       contents: write # download the assets + upload the receipts
     outputs:
@@ -125,6 +139,16 @@ jobs:
       STELLAR_NETWORK_PASSPHRASE: ${{ inputs.network_passphrase || (inputs.network == 'mainnet' && 'Public Global Stellar Network ; September 2015' || 'Test SDF Network ; September 2015') }}
       TAG: ${{ inputs.release_tag }}
     steps:
+      - name: Check the signing key resolved
+        env:
+          SIGNING_KEY: ${{ secrets.signing_key }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::signing_key resolved to an empty string (environment: ${ENVIRONMENT:-none}); the secret the caller names must exist where this job can read it" >&2
+            exit 1
+          fi
+
       - name: Install the stellar-registry CLI
         env:
           CLI_VERSION: ${{ inputs.registry_cli_version }}

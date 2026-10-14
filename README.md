@@ -153,6 +153,38 @@ publish:
     release_token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+#### Signing key from an environment
+
+A job that calls a reusable workflow can't set `environment:`, so pass the
+environment name as the `environment` input; the publish job runs in it.
+Store the key as an **environment** secret and pass it by name, exactly as
+for a repo secret:
+
+```yaml
+  with:
+    # …as above…
+    environment: testnet
+  secrets:
+    signing_key: ${{ secrets.CI_PUBLISH_SECRET_KEY }}  # lives in the testnet environment
+    release_token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+How GitHub resolves this ([reuse-workflows docs](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow)):
+
+- The `${{ secrets.CI_PUBLISH_SECRET_KEY }}` reference is resolved in the
+  called job that sets `environment`, so it works even when the secret
+  exists **only** in the environment.
+- If a repo or org secret has the same name, the environment secret wins.
+- A name that resolves nowhere arrives as an empty string with no error;
+  the workflow checks for that and fails before doing anything else.
+- The docs only cover the case where the caller-side and callee-side names
+  match. Don't create secrets literally named `SIGNING_KEY` or `RELEASE_TOKEN`
+  (this workflow's parameter names), so the environment's key is the only
+  thing `signing_key` can resolve to.
+
+Leave `environment` unset (the default, empty) to keep the old behavior:
+no environment, so the key must be a repo or org secret.
+
 ### `registry-publish-assets.yml`
 
 Batch publish of **every wasm on a GitHub release** via the
@@ -178,6 +210,9 @@ publish:
     signing_key: ${{ secrets.REGISTRY_PUBLISH_SECRET_KEY }}
     release_token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+It takes the same optional `environment` input as `registry-publish.yml`, with
+the same secret rules.
 
 ## Pinning
 
