@@ -22,6 +22,13 @@ name: Publish to Registry
 # (binds name→hash→author). The author's policy must allow `publish_hash`
 # too for that fallback.
 #
+# Integrity before the seed is used: the fork tarball must match
+# `stellar_cli_sha256`. The asset's attestation must come from
+# `attestation_signer_workflow` at `attestation_signer_digest` (default: this
+# workflow's own commit), built on `attestation_source_ref` (default
+# refs/heads/main) from `attestation_source_digest` (default: the release
+# tag's commit).
+#
 # Signing key from a GitHub environment: a job that calls a reusable workflow
 # can't set `environment:`, so set the `environment` input instead; the
 # publish job then runs in that environment. Pass the key as usual, naming the
@@ -102,6 +109,30 @@ on:
         required: false
         default: "stellar-registry/actions/.github/workflows/contract-release.yml"
         type: string
+      attestation_signer_digest:
+        description: >-
+          Commit of `attestation_signer_workflow` that must have built the
+          asset (`--signer-digest`). Empty = this workflow's own commit, which
+          is right when the caller pins contract-release.yml and this workflow
+          to the same sha. Required when `attestation_signer_workflow` lives in
+          another repository.
+        required: false
+        default: ""
+        type: string
+      attestation_source_ref:
+        description: >-
+          Git ref the attested build must have run on (`--source-ref`), e.g.
+          refs/heads/main, or refs/tags/<tag> for a tag-triggered build.
+        required: false
+        default: "refs/heads/main"
+        type: string
+      attestation_source_digest:
+        description: >-
+          Commit the attested build must have built (`--source-digest`).
+          Empty = the commit `release_tag` points to.
+        required: false
+        default: ""
+        type: string
       stellar_cli_repo:
         description: "owner/repo of the smart-account-signing stellar-cli fork."
         required: false
@@ -111,6 +142,15 @@ on:
         description: "Fork stellar-cli version to install (matches a v<version> release)."
         required: false
         default: "28.0.0-aha.0"
+        type: string
+      stellar_cli_sha256:
+        description: >-
+          sha256 of the fork's stellar-cli-<version>-x86_64-unknown-linux-gnu.tar.gz.
+          Change it together with `stellar_cli_version` (or `stellar_cli_repo`);
+          a mismatch, or an empty value, fails the job before the archive is
+          unpacked.
+        required: false
+        default: "580a2d469767028e575e1c57ccf55bc5a661c0ee4032fd52aaeabb9098943685"
         type: string
       environment:
         description: >-
@@ -168,11 +208,20 @@ jobs:
         env:
           REPO: ${{ inputs.stellar_cli_repo }}
           CLI_VERSION: ${{ inputs.stellar_cli_version }}
+          CLI_SHA256: ${{ inputs.stellar_cli_sha256 }}
+        # Checksummed, never trust-on-download: later steps hand this binary the
+        # signing seed, and the fork's releases are mutable, so a swapped asset
+        # could exfiltrate the key.
         run: |
           set -euo pipefail
+          if ! [[ "$CLI_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::stellar_cli_sha256 must be the 64-hex sha256 of the stellar-cli $CLI_VERSION tarball" >&2
+            exit 1
+          fi
           url="https://github.com/${REPO}/releases/download/v${CLI_VERSION}/stellar-cli-${CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
           echo "installing $url"
           curl -fsSL "$url" -o /tmp/stellar.tar.gz
+          echo "$CLI_SHA256  /tmp/stellar.tar.gz" | sha256sum -c -
           sudo tar -xzf /tmp/stellar.tar.gz -C /usr/local/bin stellar
           stellar --version
 
@@ -193,11 +242,63 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.release_token }}
           SIGNER_WORKFLOW: ${{ inputs.attestation_signer_workflow }}
+          SIGNER_DIGEST: ${{ inputs.attestation_signer_digest }}
+          SOURCE_REF: ${{ inputs.attestation_source_ref }}
+          SOURCE_DIGEST: ${{ inputs.attestation_source_digest }}
+          OWN_REPO: ${{ job.workflow_repository }}
+          OWN_SHA: ${{ job.workflow_sha }}
         # The attestation's signer is the reusable build workflow, not this repo's
         # workflow — a reusable run's certificate job_workflow_ref points at it.
+        # Naming the workflow alone would accept a build of any commit, from any
+        # ref (a branch run included), by any version of that workflow, so the
+        # check also binds all three: the ref the build ran on, the commit it
+        # built (by default the one the release tag points to), and the build
+        # workflow's own commit (by default this workflow's, as callers pin both
+        # to one sha).
         run: |
+          set -euo pipefail
+          hex40='^[0-9a-f]{40}$'
+          if [ -z "$SOURCE_REF" ]; then
+            echo "::error::attestation_source_ref is empty; name the ref the build ran on (e.g. refs/heads/main)" >&2
+            exit 1
+          fi
+
+          if [ -z "$SIGNER_DIGEST" ]; then
+            if [[ "$SIGNER_WORKFLOW" != "$OWN_REPO"/* ]]; then
+              echo "::error::attestation_signer_workflow $SIGNER_WORKFLOW is not in $OWN_REPO; pass attestation_signer_digest (the commit of it that built the asset)" >&2
+              exit 1
+            fi
+            if [ -z "$OWN_SHA" ]; then
+              echo "::error::job.workflow_sha is unavailable on this host; pass attestation_signer_digest" >&2
+              exit 1
+            fi
+            SIGNER_DIGEST="$OWN_SHA"
+          fi
+          if ! [[ "$SIGNER_DIGEST" =~ $hex40 ]]; then
+            echo "::error::signer digest '$SIGNER_DIGEST' is not a full commit sha" >&2
+            exit 1
+          fi
+
+          if [ -z "$SOURCE_DIGEST" ]; then
+            # Peel annotated tags down to the commit.
+            read -r type SOURCE_DIGEST < <(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object | "\(.type) \(.sha)"')
+            while [ "$type" = tag ]; do
+              read -r type SOURCE_DIGEST < <(gh api "repos/$GITHUB_REPOSITORY/git/tags/$SOURCE_DIGEST" --jq '.object | "\(.type) \(.sha)"')
+            done
+            if [ "$type" != commit ]; then
+              echo "::error::tag $TAG points to a $type, not a commit" >&2
+              exit 1
+            fi
+          fi
+          if ! [[ "$SOURCE_DIGEST" =~ $hex40 ]]; then
+            echo "::error::source digest '$SOURCE_DIGEST' is not a full commit sha" >&2
+            exit 1
+          fi
+
+          echo "requiring a build of $GITHUB_REPOSITORY@$SOURCE_DIGEST on $SOURCE_REF by $SIGNER_WORKFLOW@$SIGNER_DIGEST"
           gh attestation verify "$WASM" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$SIGNER_WORKFLOW"
+            --signer-workflow "$SIGNER_WORKFLOW" --signer-digest "$SIGNER_DIGEST" \
+            --source-ref "$SOURCE_REF" --source-digest "$SOURCE_DIGEST"
 
       - name: Cross-check wasm meta binver against the version
         run: |
