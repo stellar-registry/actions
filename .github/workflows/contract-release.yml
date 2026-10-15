@@ -12,8 +12,9 @@ name: Build and Release Contract
 #     `rust_toolchain` input. A floating channel in the file (stable, 1.99) is
 #     overridden with a warning. The choice is exported as RUSTUP_TOOLCHAIN,
 #     which outranks any toolchain file.
-#   - stellar-scaffold-cli (`scaffold_version`): drives the build and embeds
-#     its version, and the stellar-cli library version it links, as wasm meta.
+#   - stellar-scaffold-cli (`scaffold_version`, checked against
+#     `scaffold_sha256`): drives the build and embeds its version, and the
+#     stellar-cli library version it links, as wasm meta.
 #   - stellar-cli (`stellar_cli_version`): runs `contract optimize`.
 # The defaults are what built perch's tier-0 releases of 2026-10-09/12
 # (rsver 1.99.0, scaffold_version 0.0.27, stellar 26.0.0), so a recovery-stack
@@ -67,6 +68,15 @@ on:
         required: false
         default: "0.0.27"
         type: string
+      scaffold_sha256:
+        description: >-
+          sha256 of AhaLabs/scaffold-stellar's
+          stellar-scaffold-cli-v<version>-x86_64-unknown-linux-gnu.tar.gz.
+          Change it together with `scaffold_version`; a mismatch, or an empty
+          value, fails the build before the archive is unpacked.
+        required: false
+        default: "f24709de57e33155efd72547c9286b522d4360a379bde5af9eeb5519396f10cc"
+        type: string
     secrets:
       release_token:
         description: "Github token"
@@ -101,15 +111,23 @@ jobs:
             fi
           done
 
-      - uses: cargo-bins/cargo-binstall@3be4ad2b146f3302f92e5956c54fedbb6ae8cccc # v1.25.3
-        with:
-          version: 1.25.3
       - name: install scaffold-stellar
         env:
           SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          SCAFFOLD_SHA256: ${{ inputs.scaffold_sha256 }}
+        # Checksummed release binary: scaffold drives the build, so a swapped
+        # one would yield a malicious wasm that still gets a valid attestation.
         run: |
           set -euo pipefail
-          cargo binstall -y --locked --version "=$SCAFFOLD_VERSION" stellar-scaffold-cli
+          if ! [[ "$SCAFFOLD_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::scaffold_sha256 must be the 64-hex sha256 of the stellar-scaffold-cli $SCAFFOLD_VERSION tarball"
+            exit 1
+          fi
+          url="https://github.com/AhaLabs/scaffold-stellar/releases/download/stellar-scaffold-cli-v${SCAFFOLD_VERSION}/stellar-scaffold-cli-v${SCAFFOLD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "installing $url"
+          curl -fsSL "$url" -o /tmp/scaffold.tar.gz
+          echo "$SCAFFOLD_SHA256  /tmp/scaffold.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/scaffold.tar.gz -C /usr/local/bin stellar-scaffold
           stellar-scaffold --version
       - name: Set working directory
         run: |
