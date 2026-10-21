@@ -16,8 +16,7 @@ name: Build and Release Contract
 #     its version, and the stellar-cli library version it links, as wasm meta.
 #   - stellar-cli (`stellar_cli_version`): runs `contract optimize`.
 # Changing a default changes the hash of every caller that relies on it, so
-# it is a major release. v1.x defaults (rsver 1.99.0, scaffold 0.0.27,
-# stellar 26.0.0) reproduce perch's tier-0 releases of 2026-10-09/12.
+# it is a major release.
 
 on:
   workflow_call:
