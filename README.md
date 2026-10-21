@@ -107,8 +107,15 @@ workflow runs on; a macOS arm64 build of the same inputs can differ):
 | Tool | Version used | Default |
 | --- | --- | --- |
 | rustc | the repo's `rust-toolchain.toml` / `rust-toolchain` channel if it is concrete (`1.99.0`, `nightly-2026-01-01`), else the `rust_toolchain` input | `1.99.0` |
-| stellar-scaffold-cli (`stellar scaffold build`) | `scaffold_version` | `0.0.27` |
+| stellar-scaffold-cli (`stellar scaffold build`) | `scaffold_version`, checked against `scaffold_sha256` | `0.0.27` |
 | stellar-cli (`stellar contract optimize`) | `stellar_cli_version` | `26.0.0` |
+
+scaffold is installed from AhaLabs/scaffold-stellar's x86_64 Linux release
+tarball, and the build fails before unpacking it unless the tarball's sha256
+equals `scaffold_sha256`. The default is the digest of the `0.0.27` asset, so
+a caller that overrides `scaffold_version` has to pass the matching
+`scaffold_sha256` too. stellar-cli comes from the `stellar/stellar-cli` action,
+which verifies the release's GitHub attestation itself.
 
 A floating channel in the toolchain file (`stable`, `1.99`) doesn't fail the
 build: it's overridden by `rust_toolchain` with a warning. Pin the file to a
@@ -122,7 +129,7 @@ versions each build used.
 
 On-chain publish of a **single** wasm to an **explicit registry contract id**,
 authored by a **smart account** (C…): downloads the release asset, verifies
-its provenance (`gh attestation verify --signer-workflow`), cross-checks the
+its provenance (see [Build provenance](#build-provenance)), cross-checks the
 wasm's `binver` metadata, then publishes with a smart-account-signed
 `publish` (the author's signature covers the wasm bytes) via the
 CAP-71-signing [theahaco/stellar-cli](https://github.com/theahaco/stellar-cli)
@@ -152,6 +159,47 @@ publish:
     signing_key: ${{ secrets.CI_PUBLISH_SECRET_KEY }}  # CAP-71 delegate key
     release_token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+#### Signing CLI checksum
+
+The fork's release assets are mutable, and the publish job hands the binary
+the signing seed. The job therefore checks the tarball against
+`stellar_cli_sha256` before unpacking it. A mismatch or an empty value fails
+the job. The default is the digest of the default `stellar_cli_version`
+(`28.0.0-aha.0`), so a caller that overrides `stellar_cli_version` or
+`stellar_cli_repo` must pass the matching `stellar_cli_sha256` too:
+
+```sh
+gh api repos/theahaco/stellar-cli/releases/tags/v<version> \
+  --jq '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .digest'
+```
+
+#### Build provenance
+
+`gh attestation verify` requires an attestation that binds all of these:
+
+| Flag | Input | Default |
+| --- | --- | --- |
+| `--signer-workflow` | `attestation_signer_workflow` | `stellar-registry/actions/.github/workflows/contract-release.yml` |
+| `--signer-digest` | `attestation_signer_digest` | this workflow's own commit (`job.workflow_sha`) |
+| `--source-ref` | `attestation_source_ref` | `refs/heads/main` |
+| `--source-digest` | `attestation_source_digest` | the commit `release_tag` points to (annotated tags peeled) |
+
+Without the last three, any build of the signer workflow would pass: one run
+from a feature branch, one of another commit, or one by a different version of
+`contract-release.yml`.
+
+The `--signer-digest` default assumes the caller pins `contract-release.yml` and
+`registry-publish.yml` to the **same** sha, as in the examples above. Pass
+`attestation_signer_digest` explicitly in two cases:
+
+- republishing an asset that an older `contract-release.yml` pin built (a
+  recovery dispatch after a pin bump): pass the sha that built it;
+- `attestation_signer_workflow` names a workflow in another repository, where
+  this workflow's commit means nothing. The job refuses to guess and fails.
+
+A build that runs on another ref, such as a tag-triggered build, passes that
+ref in `attestation_source_ref` (`refs/tags/<tag>`).
 
 #### Signing key from an environment
 
