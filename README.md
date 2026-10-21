@@ -219,3 +219,14 @@ the same secret rules.
 Pin `uses:` references to a commit sha, not a branch — these workflows sign
 attestations and submit transactions; a branch ref would let a later change to
 this repo alter what your release run executes.
+
+Releases are semver tags (`v1.0.0`, …) with GitHub release notes. Pin the
+release's commit sha and name the tag in a trailing comment; Dependabot's
+`github-actions` updater then opens PRs that bump both:
+
+```yaml
+uses: stellar-registry/actions/.github/workflows/release-pr.yml@839f1e9af38719c151468428a6832ef7bce0eec8 # v1.0.0
+```
+
+A breaking change to a workflow's inputs, outputs or default tool versions is
+a major release, since default tool versions change the built Wasm's hash.
