@@ -178,6 +178,11 @@ jobs:
             echo "Merging bumps the versions on main; \`detect-releases\` then tags them."
             echo "__RPBODY__"
           } >>"$GITHUB_OUTPUT"
+      # The sed bump above leaves Cargo.lock at the old versions; refresh just
+      # the workspace members so callers building with --locked stay green.
+      - name: Refresh Cargo.lock
+        if: steps.prep.outputs.any == 'true' && hashFiles('Cargo.lock') != ''
+        run: cargo update --workspace
       - name: Open / update the release PR
         if: steps.prep.outputs.any == 'true'
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
