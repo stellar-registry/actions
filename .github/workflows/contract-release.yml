@@ -15,9 +15,8 @@ name: Build and Release Contract
 #   - stellar-scaffold-cli (`scaffold_version`): drives the build and embeds
 #     its version, and the stellar-cli library version it links, as wasm meta.
 #   - stellar-cli (`stellar_cli_version`): runs `contract optimize`.
-# The defaults are what built perch's tier-0 releases of 2026-10-09/12
-# (rsver 1.99.0, scaffold_version 0.0.27, stellar 26.0.0), so a recovery-stack
-# pin chain built with them lines up with those published hashes.
+# Changing a default changes the hash of every caller that relies on it, so
+# it is a major release.
 
 on:
   workflow_call:
@@ -55,17 +54,17 @@ on:
           Concrete Rust toolchain (X.Y.Z, or <channel>-YYYY-MM-DD) used when the
           repo's rust-toolchain.toml doesn't name a concrete version itself.
         required: false
-        default: "1.99.0"
+        default: "1.99.1"
         type: string
       stellar_cli_version:
         description: "Exact stellar-cli release to install (runs `stellar contract optimize`)."
         required: false
-        default: "26.0.0"
+        default: "28.1.0"
         type: string
       scaffold_version:
         description: "Exact stellar-scaffold-cli release to install (runs `stellar scaffold build`)."
         required: false
-        default: "0.0.27"
+        default: "0.0.31"
         type: string
     secrets:
       release_token:
@@ -225,7 +224,7 @@ jobs:
           echo "OUTPUT=$OUTPUT" >>"$GITHUB_ENV"
 
       - name: Install stellar-cli
-        uses: stellar/stellar-cli@60f7458e7ecffddf2f2d91dc6d0d2db4fab03ecc # v26.0.0
+        uses: stellar/stellar-cli@c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd # v28.1.0
         with:
           # The action installs (and attestation-verifies) this release; without
           # it, it would derive the version from the ref, which is a sha here.
