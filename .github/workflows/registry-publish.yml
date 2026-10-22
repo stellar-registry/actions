@@ -274,7 +274,9 @@ jobs:
 
       - name: Deploy the content-addressed instance
         id: deploy
-        if: ${{ inputs.deploy && env.SKIP != '1' }}
+        # Not gated on SKIP: a rerun after a publish that landed but a deploy that
+        # failed must still deploy, and redeploying is idempotent.
+        if: ${{ inputs.deploy }}
         env:
           STELLAR_ACCOUNT: ${{ secrets.signing_key }}
         run: |
