@@ -214,6 +214,43 @@ publish:
 It takes the same optional `environment` input as `registry-publish.yml`, with
 the same secret rules.
 
+#### Releases from your own pipeline
+
+A repo that builds and attests its Wasms with its own release workflow can
+publish them with this one, as long as each Wasm is a release asset with a
+build-provenance attestation. If the assets are named `<package>.wasm`
+without a version, pass the version separately. Use `packages` to pick the
+deployable Wasms out of a release that also carries other assets:
+
+```yaml
+publish:
+  needs: release
+  permissions:
+    contents: write
+  uses: stellar-registry/actions/.github/workflows/registry-publish-assets.yml@<sha>
+  with:
+    release_tag: ${{ github.ref_name }}           # v1.2.3
+    version: ${{ github.ref_name }}               # leading v is dropped
+    packages: controller pool governance price_aggregator
+    name_prefix: "my-org/"
+    network: mainnet
+  secrets:
+    signing_key: ${{ secrets.REGISTRY_PUBLISH_SECRET_KEY }}
+    release_token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Underscores in package names become hyphens on-chain
+(`price_aggregator` → `my-org/price-aggregator`). Leave
+`attestation_signer_workflow` empty: verification then accepts attestations
+made by any workflow in the caller repo.
+
+The job fails if a listed package has no asset, or if no asset is
+publishable at all.
+
+This path sends each Wasm in a single `publish` transaction, which fails for
+Wasms over roughly 100 KB. `registry-publish.yml` falls back to
+`contract upload` + `publish_hash` for those.
+
 ## Pinning
 
 Pin `uses:` references to a commit sha, not a branch — these workflows sign

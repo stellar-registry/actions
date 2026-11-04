@@ -44,6 +44,22 @@ on:
         required: false
         default: ""
         type: string
+      version:
+        description: >-
+          Version for assets named <package>.wasm, with no _v<version> suffix
+          (e.g. "1.2.3", or the tag "v1.2.3"; a leading v is dropped). Empty = only
+          <package>_v<version>.wasm assets are published.
+        required: false
+        default: ""
+        type: string
+      packages:
+        description: >-
+          Space-separated packages to publish, as parsed from the asset
+          filenames. Empty = every asset matching asset_pattern. A listed
+          package with no asset fails the job.
+        required: false
+        default: ""
+        type: string
       network:
         description: "Stellar network: testnet | mainnet."
         required: false
@@ -208,8 +224,23 @@ jobs:
           REGISTRY_INPUT: ${{ inputs.registry }}
           INCLUSION_FEE: ${{ inputs.inclusion_fee }}
           DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ inputs.version }}
+          PACKAGES: ${{ inputs.packages }}
         run: |
           set -euo pipefail
+          semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?'
+          pkg_re='[A-Za-z0-9_][A-Za-z0-9_-]*'
+          VERSION="${VERSION#v}"
+          if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^${semver}$ ]]; then
+            echo "::error::version '$VERSION' is not semver"
+            exit 1
+          fi
+          for p in $PACKAGES; do
+            if ! [[ "$p" =~ ^${pkg_re}$ ]]; then
+              echo "::error::invalid package name in packages: $p"
+              exit 1
+            fi
+          done
           # The CLI reads these only when set — an empty value would be parsed,
           # not ignored, so export conditionally.
           if [ -n "$REGISTRY_INPUT" ]; then export STELLAR_REGISTRY_CONTRACT_ID="$REGISTRY_INPUT"; fi
@@ -220,16 +251,27 @@ jobs:
 
           receipts='[]'
           failed=""
+          seen=" "
           for w in dist/*.wasm; do
             f=$(basename "$w")
-            # Filename shape from the build workflows: <package>_v<version>.wasm.
-            # Strict parse — package and version reach the CLI's argv.
-            if ! [[ "$f" =~ ^([A-Za-z0-9_][A-Za-z0-9_-]*)_v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)\.wasm$ ]]; then
+            # <package>_v<version>.wasm from the build workflows, or
+            # <package>.wasm with the `version` input. Strict parse — package
+            # and version reach the CLI's argv.
+            if [[ "$f" =~ ^(${pkg_re})_v(${semver})\.wasm$ ]]; then
+              pkg="${BASH_REMATCH[1]}"
+              ver="${BASH_REMATCH[2]}"
+            elif [ -n "$VERSION" ] && [[ "$f" =~ ^(${pkg_re})\.wasm$ ]]; then
+              pkg="${BASH_REMATCH[1]}"
+              ver="$VERSION"
+            else
               echo "::warning::skipping asset with unrecognized name shape: $f"
               continue
             fi
-            pkg="${BASH_REMATCH[1]}"
-            ver="${BASH_REMATCH[2]}"
+            if [ -n "$PACKAGES" ] && [[ " $PACKAGES " != *" $pkg "* ]]; then
+              echo "skipping $f: not in packages"
+              continue
+            fi
+            seen="$seen$pkg "
             wname="${NAME_PREFIX}${pkg}"
             hash=$(sha256sum "$w" | cut -d' ' -f1)
 
@@ -263,6 +305,19 @@ jobs:
                 '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"failed"}]' <<<"$receipts")
             fi
           done
+
+          for p in $PACKAGES; do
+            if [[ "$seen" != *" $p "* ]]; then
+              echo "::error::package $p has no publishable asset on $TAG"
+              failed="$failed $p"
+            fi
+          done
+          # Every asset skipped (e.g. unversioned names without `version`) is a
+          # misconfiguration, not a successful publish of nothing.
+          if [ "$seen" = " " ]; then
+            echo "::error::no publishable assets on $TAG"
+            failed="$failed (none)"
+          fi
 
           echo "receipts=$receipts" >>"$GITHUB_OUTPUT"
           {
