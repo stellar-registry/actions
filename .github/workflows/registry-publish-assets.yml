@@ -121,6 +121,27 @@ on:
         required: false
         default: "4060fae8f95955a0f2aaf62e78879bda7d002d44e951969e61467f09d8685f01"
         type: string
+      publish_max_wasm_bytes:
+        description: >-
+          Largest wasm published with a single `publish` call; bigger ones use
+          `stellar contract upload` + `publish-hash`. 0 = always upload +
+          publish-hash
+        required: false
+        default: 61440
+        type: number
+      stellar_cli_version:
+        description: "stellar-cli release to install, for `contract upload`."
+        required: false
+        default: "28.1.0"
+        type: string
+      stellar_cli_sha256:
+        description: >-
+          sha256 of the stellar-cli x86_64-unknown-linux-gnu tarball for
+          stellar_cli_version. Must be updated together with the version;
+          empty skips verification (warned).
+        required: false
+        default: "c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462"
+        type: string
       environment:
         description: >-
           GitHub environment the publish job runs in, so `signing_key` can name
@@ -137,7 +158,7 @@ on:
         required: true
     outputs:
       receipts:
-        description: "JSON array [{wasm_name, version, wasm_hash, status}] — status: published | already-published | hash-mismatch | failed."
+        description: "JSON array [{wasm_name, version, wasm_hash, method, status}] — method: publish | publish_hash (absent when skipped); status: published | already-published | hash-mismatch | failed."
         value: ${{ jobs.publish.outputs.receipts }}
 
 jobs:
@@ -181,6 +202,23 @@ jobs:
           fi
           sudo tar -xzf /tmp/srcli.tar.gz -C /usr/local/bin stellar-registry
           stellar-registry --help >/dev/null
+
+      - name: Install stellar-cli
+        env:
+          CLI_VERSION: ${{ inputs.stellar_cli_version }}
+          CLI_SHA256: ${{ inputs.stellar_cli_sha256 }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/stellar/stellar-cli/releases/download/v${CLI_VERSION}/stellar-cli-${CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "installing $url"
+          curl -fsSL "$url" -o /tmp/stellar.tar.gz
+          if [ -n "$CLI_SHA256" ]; then
+            echo "$CLI_SHA256  /tmp/stellar.tar.gz" | sha256sum -c -
+          else
+            echo "::warning::stellar_cli_sha256 is empty — skipping checksum verification"
+          fi
+          sudo tar -xzf /tmp/stellar.tar.gz -C /usr/local/bin stellar
+          stellar --version
 
       - name: Download the release assets
         env:
@@ -226,6 +264,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           VERSION: ${{ inputs.version }}
           PACKAGES: ${{ inputs.packages }}
+          MAX_WASM: ${{ inputs.publish_max_wasm_bytes }}
         run: |
           set -euo pipefail
           semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?'
@@ -294,15 +333,39 @@ jobs:
               continue
             fi
 
-            echo "publishing $wname v$ver ($hash)"
-            if stellar-registry publish --wasm "$w" --wasm-name "$wname" --binver "$ver" "${EXTRA[@]}"; then
-              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
-                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"published"}]' <<<"$receipts")
+            # A wasm too big for one `publish` transaction is installed with
+            # `contract upload` (any size), then bound name→hash→author.
+            size=$(wc -c <"$w" | tr -d ' ')
+            if [ "$MAX_WASM" -gt 0 ] && [ "$size" -le "$MAX_WASM" ]; then
+              method=publish
             else
-              echo "::error::publish failed for $wname v$ver"
+              method=publish_hash
+            fi
+            echo "publishing $wname v$ver ($hash, $size bytes, $method)"
+            ok=0
+            if [ "$method" = publish ]; then
+              stellar-registry publish --wasm "$w" --wasm-name "$wname" --binver "$ver" "${EXTRA[@]}" && ok=1
+            else
+              # publish_hash doesn't read the code, so a dry run skips the
+              # upload and simulates only the bind.
+              uploaded="$hash"
+              if [ "$DRY_RUN" != "true" ]; then
+                uploaded=$(stellar contract upload --wasm "$w" | tail -n1) || uploaded=""
+              fi
+              if [ "$uploaded" != "$hash" ]; then
+                echo "::error::upload of $f failed or returned hash '$uploaded' (local $hash)"
+              else
+                stellar-registry publish-hash --wasm-hash "$hash" --wasm-name "$wname" --version "$ver" "${EXTRA[@]}" && ok=1
+              fi
+            fi
+            if [ "$ok" = 1 ]; then
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" --arg m "$method" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, method:$m, status:"published"}]' <<<"$receipts")
+            else
+              echo "::error::$method failed for $wname v$ver"
               failed="$failed $wname@$ver"
-              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
-                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"failed"}]' <<<"$receipts")
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" --arg m "$method" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, method:$m, status:"failed"}]' <<<"$receipts")
             fi
           done
 

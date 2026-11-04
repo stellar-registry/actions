@@ -247,9 +247,10 @@ made by any workflow in the caller repo.
 The job fails if a listed package has no asset, or if no asset is
 publishable at all.
 
-This path sends each Wasm in a single `publish` transaction, which fails for
-Wasms over roughly 100 KB. `registry-publish.yml` falls back to
-`contract upload` + `publish_hash` for those.
+A Wasm over `publish_max_wasm_bytes` (default 61440) is installed with
+`stellar contract upload` and then named with `publish-hash`, the same
+fallback `registry-publish.yml` uses. The receipt records which `method` each
+Wasm took.
 
 ## Pinning
 
