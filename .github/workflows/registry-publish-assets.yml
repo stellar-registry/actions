@@ -129,11 +129,6 @@ on:
         required: false
         default: 61440
         type: number
-      stellar_cli_version:
-        description: "stellar-cli release to install, for `contract upload`."
-        required: false
-        default: "28.1.0"
-        type: string
       environment:
         description: >-
           GitHub environment the publish job runs in, so `signing_key` can name
@@ -198,9 +193,9 @@ jobs:
       - name: Install stellar-cli
         uses: stellar/stellar-cli@c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd # v28.1.0
         with:
-          # The action installs (and attestation-verifies) this release; without
-          # it, it would derive the version from the ref, which is a sha here.
-          version: ${{ inputs.stellar_cli_version }}
+          # Keep in step with the tag above: the action reads the version from
+          # its ref otherwise, which is a sha here.
+          version: 28.1.0
 
       - name: Download the release assets
         env:
