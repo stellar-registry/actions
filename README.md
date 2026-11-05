@@ -187,14 +187,18 @@ no environment, so the key must be a repo or org secret.
 
 ### `registry-publish-assets.yml`
 
-Batch publish of **every wasm on a GitHub release** via the
+Batch publish of **the wasms on a GitHub release** via the
 [stellar-registry CLI](https://github.com/stellar-registry/cli) — the
 classic-key path: the author is a G… account (default: the signing key
 itself), and names resolve through the network's verified registry, including
 `<channel>/<name>` sub-registry names via `name_prefix`. Verifies each
 asset's provenance first. Idempotent: already-published (same-hash) versions
 are skipped so reruns after partial failures are safe; a same-version
-different-hash asset refuses. One failing asset doesn't abort the batch.
+different-hash asset refuses. One failing asset doesn't abort the batch, and a
+run with no publishable asset fails. A wasm over `publish_max_wasm_bytes`
+(default 61440) is installed with `stellar contract upload` and then named
+with `publish-hash`, the same fallback `registry-publish.yml` uses; the
+receipt records which `method` each wasm took.
 
 ```yaml
 publish:
@@ -213,6 +217,38 @@ publish:
 
 It takes the same optional `environment` input as `registry-publish.yml`, with
 the same secret rules.
+
+#### Releases from your own pipeline
+
+A repo that builds and attests its Wasms with its own release workflow can
+publish them with this one, as long as each Wasm is a release asset with a
+build-provenance attestation. If the assets are named `<package>.wasm`
+without a version, pass the version separately. Use `packages` to pick the
+deployable Wasms out of a release that also carries other assets:
+
+```yaml
+publish:
+  needs: release
+  permissions:
+    contents: write
+  uses: stellar-registry/actions/.github/workflows/registry-publish-assets.yml@<sha>
+  with:
+    release_tag: ${{ github.ref_name }}           # v1.2.3
+    version: ${{ github.ref_name }}               # leading v is dropped
+    packages: controller pool governance price_aggregator
+    name_prefix: "my-org/"
+    network: mainnet
+  secrets:
+    signing_key: ${{ secrets.REGISTRY_PUBLISH_SECRET_KEY }}
+    release_token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Underscores in package names become hyphens on-chain
+(`price_aggregator` → `my-org/price-aggregator`). Leave
+`attestation_signer_workflow` empty: verification then accepts attestations
+made by any workflow in the caller repo.
+
+The job fails if a listed package has no asset.
 
 ## Pinning
 
