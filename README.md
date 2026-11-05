@@ -187,14 +187,18 @@ no environment, so the key must be a repo or org secret.
 
 ### `registry-publish-assets.yml`
 
-Batch publish of **every wasm on a GitHub release** via the
+Batch publish of **the wasms on a GitHub release** via the
 [stellar-registry CLI](https://github.com/stellar-registry/cli) — the
 classic-key path: the author is a G… account (default: the signing key
 itself), and names resolve through the network's verified registry, including
 `<channel>/<name>` sub-registry names via `name_prefix`. Verifies each
 asset's provenance first. Idempotent: already-published (same-hash) versions
 are skipped so reruns after partial failures are safe; a same-version
-different-hash asset refuses. One failing asset doesn't abort the batch.
+different-hash asset refuses. One failing asset doesn't abort the batch, and a
+run with no publishable asset fails. A wasm over `publish_max_wasm_bytes`
+(default 61440) is installed with `stellar contract upload` and then named
+with `publish-hash`, the same fallback `registry-publish.yml` uses; the
+receipt records which `method` each wasm took.
 
 ```yaml
 publish:
@@ -244,13 +248,7 @@ Underscores in package names become hyphens on-chain
 `attestation_signer_workflow` empty: verification then accepts attestations
 made by any workflow in the caller repo.
 
-The job fails if a listed package has no asset, or if no asset is
-publishable at all.
-
-A Wasm over `publish_max_wasm_bytes` (default 61440) is installed with
-`stellar contract upload` and then named with `publish-hash`, the same
-fallback `registry-publish.yml` uses. The receipt records which `method` each
-Wasm took.
+The job fails if a listed package has no asset.
 
 ## Pinning
 
