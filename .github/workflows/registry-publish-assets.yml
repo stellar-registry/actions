@@ -379,6 +379,8 @@ jobs:
           RECEIPTS: ${{ steps.publish.outputs.receipts }}
         run: |
           set -euo pipefail
-          jq . <<<"$RECEIPTS" >registry-publish-receipts.json
-          gh release upload "$TAG" registry-publish-receipts.json --clobber \
-            --repo "$GITHUB_REPOSITORY"
+          # Per network, so a testnet and a mainnet run on one release don't
+          # overwrite each other's receipts.
+          file="registry-publish-receipts-${STELLAR_NETWORK//[^A-Za-z0-9_-]/_}.json"
+          jq . <<<"$RECEIPTS" >"$file"
+          gh release upload "$TAG" "$file" --clobber --repo "$GITHUB_REPOSITORY"
