@@ -296,14 +296,17 @@ jobs:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           METHOD: ${{ steps.publish.outputs.method }}
         run: |
+          # Per network, so testnet and mainnet receipts on one release don't
+          # overwrite each other.
+          file="publish-receipt-${STELLAR_NETWORK//[^A-Za-z0-9_-]/_}.json"
           jq -n \
             --arg registry "$REGISTRY" --arg wasm_name "$WASM_NAME" \
             --arg version "$VERSION" --arg wasm_hash "$WASM_HASH" \
             --arg author "$AUTHOR" --arg contract_id "$CONTRACT_ID" \
             --arg network "$STELLAR_NETWORK" --arg method "$METHOD" \
-            '$ARGS.named' >publish-receipt.json
-          gh release upload "$TAG" publish-receipt.json --clobber --repo "$GITHUB_REPOSITORY"
+            '$ARGS.named' >"$file"
+          gh release upload "$TAG" "$file" --clobber --repo "$GITHUB_REPOSITORY"
           {
             echo "### $WASM_NAME $VERSION published to $REGISTRY"
-            echo '```json'; cat publish-receipt.json; echo '```'
+            echo '```json'; cat "$file"; echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
