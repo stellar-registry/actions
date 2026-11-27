@@ -145,7 +145,7 @@ on:
         required: true
     outputs:
       receipts:
-        description: "JSON array [{wasm_name, version, wasm_hash, method, status}] — method: publish | publish_hash (absent when skipped); status: published | already-published | hash-mismatch | failed."
+        description: "JSON array [{wasm_name, version, wasm_hash, method, status}] — method: publish | publish_hash (absent when skipped); status: published | already-published | unchanged | hash-mismatch | failed."
         value: ${{ jobs.publish.outputs.receipts }}
 
 jobs:
@@ -307,6 +307,16 @@ jobs:
               failed="$failed $wname@$ver"
               receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
                 '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"hash-mismatch"}]' <<<"$receipts")
+              continue
+            fi
+
+            # The registry refuses a hash it already holds (HashAlreadyPublished),
+            # so a contract unchanged since its latest version gets no new one.
+            latest=$(stellar-registry fetch-hash "$wname" 2>/dev/null) || latest=""
+            if [ "$latest" = "$hash" ]; then
+              echo "$wname unchanged since its latest version — skipping v$ver"
+              receipts=$(jq -c --arg n "$wname" --arg v "$ver" --arg h "$hash" \
+                '. + [{wasm_name:$n, version:$v, wasm_hash:$h, status:"unchanged"}]' <<<"$receipts")
               continue
             fi
 

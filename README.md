@@ -194,7 +194,8 @@ itself), and names resolve through the network's verified registry, including
 `<channel>/<name>` sub-registry names via `name_prefix`. Verifies each
 asset's provenance first. Idempotent: already-published (same-hash) versions
 are skipped so reruns after partial failures are safe; a same-version
-different-hash asset refuses. One failing asset doesn't abort the batch, and a
+different-hash asset refuses. A wasm identical to its name's latest version
+is skipped as unchanged, since the registry rejects a hash it already holds. One failing asset doesn't abort the batch, and a
 run with no publishable asset fails. A wasm over `publish_max_wasm_bytes`
 (default 61440) is installed with `stellar contract upload` and then named
 with `publish-hash`, the same fallback `registry-publish.yml` uses; the
